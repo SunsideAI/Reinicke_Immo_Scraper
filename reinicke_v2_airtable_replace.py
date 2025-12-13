@@ -226,6 +226,7 @@ def get_propstack_property_data_from_iframe(iframe_url: str) -> dict:
         
         # Unterkategorie aus Titel oder Text extrahieren
         text_content = soup.get_text().lower()
+        text_content_full = soup.get_text()  # FULL text für Preis und PLZ/Ort
         titel_lower = data["titel"].lower()
         
         # Einfache Kategorien wie auf der Website
@@ -284,7 +285,7 @@ def get_propstack_property_data_from_iframe(iframe_url: str) -> dict:
                     pass
         
         # PLZ/Ort - mit mehreren Ansätzen
-        text_content_full = soup.get_text()
+        # (text_content_full wurde bereits oben definiert)
         
         # Ansatz 1: Standard PLZ-Pattern
         match = RE_PLZ_ORT.search(text_content_full)
