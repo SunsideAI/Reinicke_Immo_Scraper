@@ -79,7 +79,14 @@ def soup_get(url: str, delay: float = REQUEST_DELAY) -> BeautifulSoup:
 def collect_detail_page_links_with_categories() -> List[Tuple[str, str, str]]:
     """Sammle Links zu Detailseiten MIT Kategorie/Unterkategorie von Übersichtsseite"""
     print(f"[LIST] Hole {LIST_URL}")
-    soup = soup_get(LIST_URL)
+    
+    # Wichtig: Encoding explizit setzen
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    }
+    r = requests.get(LIST_URL, headers=headers, timeout=30)
+    r.encoding = 'utf-8'  # Explizit UTF-8 setzen
+    soup = BeautifulSoup(r.text, "lxml")
     
     detail_data = []  # Liste von (url, kategorie, unterkategorie)
     
@@ -95,62 +102,65 @@ def collect_detail_page_links_with_categories() -> List[Tuple[str, str, str]]:
         "mehrfamilienhäuser": ("Kaufen", "Haus"),
         "eigentumswohnung": ("Kaufen", "Wohnung"),
         "eigentumswohnungen": ("Kaufen", "Wohnung"),
-        "gewerbeimmobilie": (None, "Gewerbe"),  # Kategorie wird später bestimmt
+        "gewerbeimmobilie": (None, "Gewerbe"),  # Kategorie aus Preis
         "gewerbeimmobilien": (None, "Gewerbe"),
-        "mietobjekt": ("Mieten", None),  # Unterkategorie wird später bestimmt
+        "mietobjekt": ("Mieten", None),  # Unterkategorie aus Titel
         "mietobjekte": ("Mieten", None),
         "grundstück": ("Kaufen", "Grundstück"),
         "grundstücke": ("Kaufen", "Grundstück"),
         "neubau": ("Kaufen", "Haus"),
     }
     
-    current_kategorie = "Kaufen"  # Default
-    current_unterkategorie = "Haus"  # Default
-    
-    # Durchlaufe die Seite und suche nach Überschriften + Links
-    for elem in soup.find_all(["h1", "h2", "h3", "h4", "a"]):
+    # Sammle alle Immobilien-Links
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
         
-        # Ist es eine Überschrift?
-        if elem.name in ["h1", "h2", "h3", "h4"]:
-            text = elem.get_text(strip=True).lower()
-            
-            # Prüfe ob es eine bekannte Sektion ist
+        # Filter: Links die zu Immobilien-Details führen
+        if not any(pattern in href.lower() for pattern in [
+            "/grundstueck",
+            "/einfamilienhaus",
+            "/zweifamilienhaus",
+            "/mehrfamilienhaus",
+            "/wohnung",
+            "/haus",
+            "/villa",
+            "/doppelhaus",
+            "/gewerbe",
+            "/buero",
+            "/penthouse"
+        ]):
+            continue
+        
+        # Mache URL absolut
+        full_url = urljoin(BASE, href)
+        full_url = full_url.split("#")[0].split("?")[0]
+        
+        # Dedupliziere
+        if any(d[0] == full_url for d in detail_data) or full_url == LIST_URL:
+            continue
+        
+        # Finde vorherige Überschrift (h2, h3, h4)
+        prev_header_text = ""
+        for sibling in a.find_all_previous(["h2", "h3", "h4"]):
+            prev_header_text = sibling.get_text(strip=True).lower()
+            break
+        
+        # Bestimme Kategorie/Unterkategorie aus Überschrift
+        kategorie = "Kaufen"  # Default
+        unterkategorie = "Haus"  # Default
+        
+        if prev_header_text:
             for key, (kat, unterkat) in section_mapping.items():
-                if key in text:
+                if key in prev_header_text:
                     if kat:
-                        current_kategorie = kat
+                        kategorie = kat
                     if unterkat:
-                        current_unterkategorie = unterkat
-                    print(f"[DEBUG] Sektion gefunden: '{text}' → {current_kategorie} / {current_unterkategorie}")
+                        unterkategorie = unterkat
                     break
         
-        # Ist es ein Link?
-        elif elem.name == "a":
-            href = elem.get("href", "")
-            
-            # Filter: Links die zu Immobilien-Details führen
-            if any(pattern in href.lower() for pattern in [
-                "/grundstueck",
-                "/einfamilienhaus",
-                "/zweifamilienhaus",
-                "/mehrfamilienhaus",
-                "/wohnung",
-                "/haus",
-                "/villa",
-                "/doppelhaus",
-                "/gewerbe",
-                "/buero",
-                "/penthouse"
-            ]):
-                # Mache URL absolut
-                full_url = urljoin(BASE, href)
-                full_url = full_url.split("#")[0].split("?")[0]
-                
-                # Dedupliziere
-                if not any(d[0] == full_url for d in detail_data) and full_url != LIST_URL:
-                    detail_data.append((full_url, current_kategorie, current_unterkategorie))
-                    slug = full_url.split("/")[-1]
-                    print(f"[DEBUG] Found: {slug[:40]} → {current_kategorie}/{current_unterkategorie}")
+        detail_data.append((full_url, kategorie, unterkategorie))
+        slug = full_url.split("/")[-1]
+        print(f"[DEBUG] {slug[:40]:<40} → {kategorie:8} / {unterkategorie}")
     
     print(f"\n[LIST] Gefunden: {len(detail_data)} Detailseiten")
     return detail_data
