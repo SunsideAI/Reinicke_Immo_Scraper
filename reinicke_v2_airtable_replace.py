@@ -41,6 +41,11 @@ AIRTABLE_TOKEN = os.getenv("AIRTABLE_TOKEN", "")
 AIRTABLE_BASE = os.getenv("AIRTABLE_BASE", "")
 AIRTABLE_TABLE_ID = os.getenv("AIRTABLE_TABLE_ID", "")
 
+# SYNC-MODUS
+# True  = Lösche ALLES in Airtable und ersetze mit neuen Daten
+# False = Update/Create/Delete nur geänderte Records (intelligent)
+FULL_REPLACE = os.getenv("FULL_REPLACE", "true").lower() == "true"
+
 # Rate Limiting
 REQUEST_DELAY = 1.5
 
@@ -593,10 +598,11 @@ def sanitize_record_for_airtable(record: dict, allowed_fields: set) -> dict:
     return {k: v for k, v in record.items() if k in allowed_fields}
 
 def airtable_existing_fields() -> set:
-    _, all_fields = airtable_list_all()
-    if not all_fields:
-        return set()
-    return set(all_fields[0].keys())
+    """Hole existierende Felder - DEAKTIVIERT um alle Felder zuzulassen"""
+    # WICHTIG: Wenn diese Funktion ein leeres Set zurückgibt,
+    # werden ALLE Felder an Airtable gesendet (nicht gefiltert)
+    # Dies ist nötig wenn neue Felder (Unterkategorie, Standort) noch leer sind
+    return set()  # Leeres Set = keine Filterung
 
 # ===========================================================================
 # MAIN
@@ -628,47 +634,67 @@ def run():
     if AIRTABLE_TOKEN and AIRTABLE_BASE and airtable_table_segment():
         print("\n[AIRTABLE] Starte Synchronisation...")
         
-        allowed = airtable_existing_fields()
-        all_ids, all_fields = airtable_list_all()
-        
-        existing = {}
-        for rec_id, f in zip(all_ids, all_fields):
-            k = unique_key(f)
-            existing[k] = (rec_id, f)
-        
-        desired = {}
-        for r in all_rows:
-            k = unique_key(r)
-            if k in desired:
-                if len(r.get("Beschreibung", "")) > len(desired[k].get("Beschreibung", "")):
+        if FULL_REPLACE:
+            print("[AIRTABLE] Modus: FULL REPLACE - Lösche alles und ersetze")
+            
+            # Hole alle existierenden Records
+            all_ids, all_fields = airtable_list_all()
+            
+            # Lösche ALLES
+            if all_ids:
+                print(f"[AIRTABLE] Lösche {len(all_ids)} existierende Records...")
+                airtable_batch_delete(all_ids)
+            
+            # Erstelle ALLES neu
+            print(f"[AIRTABLE] Erstelle {len(all_rows)} neue Records...")
+            airtable_batch_create(all_rows)
+            
+            print(f"[AIRTABLE] ✅ Tabelle komplett ersetzt: {len(all_rows)} Records")
+            
+        else:
+            print("[AIRTABLE] Modus: INTELLIGENT SYNC - Update nur Änderungen")
+            
+            allowed = airtable_existing_fields()
+            all_ids, all_fields = airtable_list_all()
+            
+            existing = {}
+            for rec_id, f in zip(all_ids, all_fields):
+                k = unique_key(f)
+                existing[k] = (rec_id, f)
+            
+            desired = {}
+            for r in all_rows:
+                k = unique_key(r)
+                if k in desired:
+                    if len(r.get("Beschreibung", "")) > len(desired[k].get("Beschreibung", "")):
+                        desired[k] = sanitize_record_for_airtable(r, allowed)
+                else:
                     desired[k] = sanitize_record_for_airtable(r, allowed)
-            else:
-                desired[k] = sanitize_record_for_airtable(r, allowed)
-        
-        to_create, to_update, keep = [], [], set()
-        for k, fields in desired.items():
-            if k in existing:
-                rec_id, old = existing[k]
-                diff = {fld: val for fld, val in fields.items() if old.get(fld) != val}
-                if diff:
-                    to_update.append({"id": rec_id, "fields": diff})
-                keep.add(k)
-            else:
-                to_create.append(fields)
-        
-        to_delete_ids = [rec_id for k, (rec_id, _) in existing.items() if k not in keep]
-        
-        print(f"\n[SYNC] Gesamt → create: {len(to_create)}, update: {len(to_update)}, delete: {len(to_delete_ids)}")
-        
-        if to_create:
-            print(f"[Airtable] Erstelle {len(to_create)} neue Records...")
-            airtable_batch_create(to_create)
-        if to_update:
-            print(f"[Airtable] Aktualisiere {len(to_update)} Records...")
-            airtable_batch_update(to_update)
-        if to_delete_ids:
-            print(f"[Airtable] Lösche {len(to_delete_ids)} Records...")
-            airtable_batch_delete(to_delete_ids)
+            
+            to_create, to_update, keep = [], [], set()
+            for k, fields in desired.items():
+                if k in existing:
+                    rec_id, old = existing[k]
+                    diff = {fld: val for fld, val in fields.items() if old.get(fld) != val}
+                    if diff:
+                        to_update.append({"id": rec_id, "fields": diff})
+                    keep.add(k)
+                else:
+                    to_create.append(fields)
+            
+            to_delete_ids = [rec_id for k, (rec_id, _) in existing.items() if k not in keep]
+            
+            print(f"\n[SYNC] Gesamt → create: {len(to_create)}, update: {len(to_update)}, delete: {len(to_delete_ids)}")
+            
+            if to_create:
+                print(f"[Airtable] Erstelle {len(to_create)} neue Records...")
+                airtable_batch_create(to_create)
+            if to_update:
+                print(f"[Airtable] Aktualisiere {len(to_update)} Records...")
+                airtable_batch_update(to_update)
+            if to_delete_ids:
+                print(f"[Airtable] Lösche {len(to_delete_ids)} Records...")
+                airtable_batch_delete(to_delete_ids)
         
         print("[Airtable] Synchronisation abgeschlossen.\n")
     else:
