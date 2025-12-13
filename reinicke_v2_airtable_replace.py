@@ -258,7 +258,7 @@ def get_propstack_property_data_from_iframe(iframe_url: str) -> dict:
                 try:
                     clean = p.replace(".", "").replace(",", ".")
                     val = float(clean)
-                    if val > 1000:  # Filter kleine Zahlen
+                    if val > 100:  # Filter kleine Zahlen (Zimmeranzahl etc.)
                         prices.append((val, p + " €"))
                 except:
                     pass
@@ -266,6 +266,27 @@ def get_propstack_property_data_from_iframe(iframe_url: str) -> dict:
                 # Sortiere und nimm höchsten
                 prices.sort(reverse=True)
                 data["preis"] = prices[0][1]
+        
+        # SPEZIALFALL: Mietobjekte - Warmmiete/Kaltmiete explizit suchen
+        import re
+        miete_pattern = re.compile(r'(?:Warmmiete|Kaltmiete|Miete)\s*[:.]?\s*([\d.,]+)\s*€', re.IGNORECASE)
+        miete_matches = miete_pattern.findall(text_content_full)
+        
+        if miete_matches:
+            # Warmmiete bevorzugen, dann Kaltmiete
+            for miete_str in miete_matches:
+                try:
+                    clean = miete_str.replace(".", "").replace(",", ".")
+                    val = float(clean)
+                    if val > 100:
+                        # Formatiere Preis
+                        data["preis"] = f"{miete_str.replace('.', '').replace(',', '.')} €"
+                        # Setze Kategorie auf Mieten wenn Miete gefunden
+                        data["kategorie"] = "Mieten"
+                        print(f"[DEBUG] Warmmiete/Kaltmiete gefunden: {data['preis']}")
+                        break
+                except:
+                    pass
         
         # PLZ/Ort - mit mehreren Ansätzen
         text_content_full = soup.get_text()
@@ -428,8 +449,13 @@ def collect_all_properties() -> List[dict]:
             
             if prop_data:
                 # Überschreibe Kategorie/Unterkategorie mit Daten von Übersichtsseite
-                if overview_kategorie:
+                # AUSSER wenn Warmmiete/Kaltmiete im iframe gefunden wurde (dann ist es sicher Mieten)
+                if overview_kategorie and prop_data["kategorie"] != "Mieten":
                     prop_data["kategorie"] = overview_kategorie
+                elif prop_data["kategorie"] == "Mieten":
+                    # Warmmiete wurde gefunden - behalte "Mieten"
+                    pass
+                    
                 if overview_unterkategorie:
                     prop_data["unterkategorie"] = overview_unterkategorie
                 
