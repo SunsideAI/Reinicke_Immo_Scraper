@@ -85,13 +85,8 @@ def collect_detail_page_links_with_categories() -> List[Tuple[str, str, str]]:
     """Sammle Links zu Detailseiten MIT Kategorie/Unterkategorie von Übersichtsseite"""
     print(f"[LIST] Hole {LIST_URL}")
     
-    # Wichtig: Encoding explizit setzen
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-    }
-    r = requests.get(LIST_URL, headers=headers, timeout=30)
-    r.encoding = 'utf-8'  # Explizit UTF-8 setzen
-    soup = BeautifulSoup(r.text, "lxml")
+    # Verwende soup_get für konsistente Netzwerk-Behandlung
+    soup = soup_get(LIST_URL)
     
     detail_data = []  # Liste von (url, kategorie, unterkategorie)
     
