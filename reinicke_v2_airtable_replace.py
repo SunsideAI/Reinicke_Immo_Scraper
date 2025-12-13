@@ -117,23 +117,12 @@ def collect_detail_page_links_with_categories() -> List[Tuple[str, str, str]]:
     }
     
     # Sammle alle Immobilien-Links
+    # NEUE LOGIK: Nehme ALLE internen Links AUSSER Navigations-Seiten
     for a in soup.find_all("a", href=True):
         href = a["href"]
         
-        # Filter: Links die zu Immobilien-Details führen
-        if not any(pattern in href.lower() for pattern in [
-            "/grundstueck",
-            "/einfamilienhaus",
-            "/zweifamilienhaus",
-            "/mehrfamilienhaus",
-            "/wohnung",
-            "/haus",
-            "/villa",
-            "/doppelhaus",
-            "/gewerbe",
-            "/buero",
-            "/penthouse"
-        ]):
+        # Nur interne Links
+        if not (href.startswith("/") or "alainreinickeimmobilien.de" in href):
             continue
         
         # Mache URL absolut
@@ -142,6 +131,28 @@ def collect_detail_page_links_with_categories() -> List[Tuple[str, str, str]]:
         
         # Dedupliziere
         if any(d[0] == full_url for d in detail_data) or full_url == LIST_URL:
+            continue
+        
+        # BLACKLIST: Überspringe Navigations-Seiten
+        path_lower = full_url.lower()
+        if any(skip in path_lower for skip in [
+            "/startseite",
+            "/warum-wir", 
+            "/immobilien-ankauf",
+            "/immobilienbewertung",
+            "/aktuelle-angebote",
+            "/kontakt",
+            "/impressum",
+            "/datenschutz",
+            "/agb",
+            "/cookie",
+            BASE + "/#",
+            BASE + "/$"
+        ]):
+            continue
+        
+        # Ignoriere root URL
+        if full_url == BASE or full_url == BASE + "/":
             continue
         
         # Finde vorherige Überschrift (h2, h3, h4)
