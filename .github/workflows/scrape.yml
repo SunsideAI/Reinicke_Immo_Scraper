@@ -1,0 +1,39 @@
+name: Scrape Immobilien DUIS
+
+on:
+  schedule:
+    - cron: '30 6 * * *'  # Täglich um 06:30 UTC (07:30 MEZ)
+  workflow_dispatch:  # Manueller Trigger
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install Dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements
+      
+      - name: Run Scraper
+        env:
+          AIRTABLE_TOKEN: ${{ secrets.AIRTABLE_TOKEN }}
+          AIRTABLE_BASE: ${{ secrets.AIRTABLE_BASE }}
+          AIRTABLE_TABLE_ID: ${{ secrets.AIRTABLE_TABLE_ID }}
+        run: |
+          python duis_v2_airtable_replace.py
+      
+      - name: Upload CSV Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: duis-immobilien-csv
+          path: duis_immobilien.csv
+          retention-days: 7
