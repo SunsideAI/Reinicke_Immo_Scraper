@@ -76,45 +76,84 @@ def soup_get(url: str, delay: float = REQUEST_DELAY) -> BeautifulSoup:
 # PROPSTACK IFRAME FUNCTIONS
 # ===========================================================================
 
-def collect_detail_page_links() -> List[str]:
-    """Sammle Links zu Detailseiten von der Übersichtsseite"""
+def collect_detail_page_links_with_categories() -> List[Tuple[str, str, str]]:
+    """Sammle Links zu Detailseiten MIT Kategorie/Unterkategorie von Übersichtsseite"""
     print(f"[LIST] Hole {LIST_URL}")
     soup = soup_get(LIST_URL)
     
-    detail_links = []
+    detail_data = []  # Liste von (url, kategorie, unterkategorie)
     
-    # Suche nach Links zu Immobilien-Detailseiten
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        text = a.get_text(strip=True).lower()
+    # Mapping: Überschrift → (Kategorie, Unterkategorie)
+    section_mapping = {
+        "einfamilienhaus": ("Kaufen", "Haus"),
+        "einfamilienhäuser": ("Kaufen", "Haus"),
+        "doppelhaushälfte": ("Kaufen", "Haus"),
+        "doppelhaushälften": ("Kaufen", "Haus"),
+        "zweifamilienhaus": ("Kaufen", "Haus"),
+        "zweifamilienhäuser": ("Kaufen", "Haus"),
+        "mehrfamilienhaus": ("Kaufen", "Haus"),
+        "mehrfamilienhäuser": ("Kaufen", "Haus"),
+        "eigentumswohnung": ("Kaufen", "Wohnung"),
+        "eigentumswohnungen": ("Kaufen", "Wohnung"),
+        "gewerbeimmobilie": (None, "Gewerbe"),  # Kategorie wird später bestimmt
+        "gewerbeimmobilien": (None, "Gewerbe"),
+        "mietobjekt": ("Mieten", None),  # Unterkategorie wird später bestimmt
+        "mietobjekte": ("Mieten", None),
+        "grundstück": ("Kaufen", "Grundstück"),
+        "grundstücke": ("Kaufen", "Grundstück"),
+        "neubau": ("Kaufen", "Haus"),
+    }
+    
+    current_kategorie = "Kaufen"  # Default
+    current_unterkategorie = "Haus"  # Default
+    
+    # Durchlaufe die Seite und suche nach Überschriften + Links
+    for elem in soup.find_all(["h1", "h2", "h3", "h4", "a"]):
         
-        # Filter: Links die zu Immobilien-Details führen
-        # Typische Muster: /grundstueck-in-..., /einfamilienhaus-..., etc.
-        # Oder: Links mit "Exposé" Text
-        if any(pattern in href.lower() for pattern in [
-            "/grundstueck",
-            "/einfamilienhaus",
-            "/zweifamilienhaus",
-            "/mehrfamilienhaus",
-            "/wohnung",
-            "/haus",
-            "/villa",
-            "/doppelhaus"
-        ]) or "exposé" in text or "expose" in text:
+        # Ist es eine Überschrift?
+        if elem.name in ["h1", "h2", "h3", "h4"]:
+            text = elem.get_text(strip=True).lower()
             
-            # Mache URL absolut
-            full_url = urljoin(BASE, href)
+            # Prüfe ob es eine bekannte Sektion ist
+            for key, (kat, unterkat) in section_mapping.items():
+                if key in text:
+                    if kat:
+                        current_kategorie = kat
+                    if unterkat:
+                        current_unterkategorie = unterkat
+                    print(f"[DEBUG] Sektion gefunden: '{text}' → {current_kategorie} / {current_unterkategorie}")
+                    break
+        
+        # Ist es ein Link?
+        elif elem.name == "a":
+            href = elem.get("href", "")
             
-            # Entferne Anker und Query-Parameter
-            full_url = full_url.split("#")[0].split("?")[0]
-            
-            # Dedupliziere
-            if full_url not in detail_links and full_url != LIST_URL:
-                detail_links.append(full_url)
-                print(f"[DEBUG] Found detail page: {full_url.split('/')[-1]}")
+            # Filter: Links die zu Immobilien-Details führen
+            if any(pattern in href.lower() for pattern in [
+                "/grundstueck",
+                "/einfamilienhaus",
+                "/zweifamilienhaus",
+                "/mehrfamilienhaus",
+                "/wohnung",
+                "/haus",
+                "/villa",
+                "/doppelhaus",
+                "/gewerbe",
+                "/buero",
+                "/penthouse"
+            ]):
+                # Mache URL absolut
+                full_url = urljoin(BASE, href)
+                full_url = full_url.split("#")[0].split("?")[0]
+                
+                # Dedupliziere
+                if not any(d[0] == full_url for d in detail_data) and full_url != LIST_URL:
+                    detail_data.append((full_url, current_kategorie, current_unterkategorie))
+                    slug = full_url.split("/")[-1]
+                    print(f"[DEBUG] Found: {slug[:40]} → {current_kategorie}/{current_unterkategorie}")
     
-    print(f"\n[LIST] Gefunden: {len(detail_links)} Detailseiten")
-    return detail_links
+    print(f"\n[LIST] Gefunden: {len(detail_data)} Detailseiten")
+    return detail_data
 
 def extract_iframe_from_detail_page(detail_url: str) -> Optional[str]:
     """Extrahiere Propstack iframe-URL von einer Detailseite"""
@@ -150,8 +189,8 @@ def get_propstack_property_data_from_iframe(iframe_url: str) -> dict:
             "beschreibung": "",
             "preis": "",
             "ort": "",
-            "kategorie": "Kaufen",
-            "unterkategorie": "",
+            "kategorie": "Kaufen",  # Default, wird von Übersichtsseite überschrieben
+            "unterkategorie": "Haus",  # Default, wird von Übersichtsseite überschrieben
             "bild_url": "",
         }
         
@@ -301,9 +340,8 @@ def get_propstack_property_data_from_iframe(iframe_url: str) -> dict:
         if not data["bild_url"]:
             print(f"[WARN] ⚠️  KEIN Bild gefunden!")
         
-        # Kategorie aus Text erkennen
-        if any(word in text_content for word in ["miete", "vermietet", "zu vermieten", "mietpreis"]):
-            data["kategorie"] = "Mieten"
+        # Kategorie/Unterkategorie werden von Übersichtsseite überschrieben
+        # Keine Erkennung mehr hier nötig
         
         return data
         
@@ -318,10 +356,10 @@ def get_propstack_property_data_from_iframe(iframe_url: str) -> dict:
 def collect_all_properties() -> List[dict]:
     """Sammle alle Immobilien von der Website"""
     
-    # Schritt 1: Sammle Links zu Detailseiten
-    detail_links = collect_detail_page_links()
+    # Schritt 1: Sammle Links zu Detailseiten MIT Kategorie-Info
+    detail_data = collect_detail_page_links_with_categories()
     
-    if not detail_links:
+    if not detail_data:
         print("[WARN] Keine Detailseiten gefunden!")
         print("[INFO] Prüfe ob die Website-Struktur sich geändert hat")
         return []
@@ -329,8 +367,8 @@ def collect_all_properties() -> List[dict]:
     # Schritt 2: Für jede Detailseite, extrahiere iframe und hole Daten
     all_properties = []
     
-    for i, detail_url in enumerate(detail_links, 1):
-        print(f"\n[SCRAPE] {i}/{len(detail_links)}")
+    for i, (detail_url, overview_kategorie, overview_unterkategorie) in enumerate(detail_data, 1):
+        print(f"\n[SCRAPE] {i}/{len(detail_data)}")
         
         try:
             # Finde iframe auf der Detailseite
@@ -344,13 +382,44 @@ def collect_all_properties() -> List[dict]:
             prop_data = get_propstack_property_data_from_iframe(iframe_url)
             
             if prop_data:
+                # Überschreibe Kategorie/Unterkategorie mit Daten von Übersichtsseite
+                if overview_kategorie:
+                    prop_data["kategorie"] = overview_kategorie
+                if overview_unterkategorie:
+                    prop_data["unterkategorie"] = overview_unterkategorie
+                
+                # Spezialfall: Gewerbe - Kategorie aus Preis ableiten
+                if prop_data["unterkategorie"] == "Gewerbe" and not overview_kategorie:
+                    # Extrahiere Preis-Wert
+                    preis_text = prop_data.get("preis", "")
+                    try:
+                        clean = preis_text.replace("€", "").replace(".", "").replace(",", ".").strip()
+                        preis_val = float(clean)
+                        if preis_val < 30000:
+                            prop_data["kategorie"] = "Mieten"
+                        else:
+                            prop_data["kategorie"] = "Kaufen"
+                    except:
+                        prop_data["kategorie"] = "Kaufen"  # Default
+                
+                # Spezialfall: Mietobjekte - Unterkategorie aus Titel ableiten
+                if prop_data["kategorie"] == "Mieten" and not overview_unterkategorie:
+                    titel_lower = prop_data.get("titel", "").lower()
+                    if "wohnung" in titel_lower:
+                        prop_data["unterkategorie"] = "Wohnung"
+                    elif "haus" in titel_lower:
+                        prop_data["unterkategorie"] = "Haus"
+                    elif "gewerbe" in titel_lower or "büro" in titel_lower:
+                        prop_data["unterkategorie"] = "Gewerbe"
+                    else:
+                        prop_data["unterkategorie"] = "Wohnung"  # Default für Mietobjekte
+                
                 # Extrahiere Objektnummer aus iframe-URL
                 import re
                 match = re.search(r"(eyJ[A-Za-z0-9+/=]+)", iframe_url)
                 if match:
                     token_b64 = match.group(1)
                     try:
-                        # Dekodiere Token
                         padding = len(token_b64) % 4
                         if padding:
                             token_b64 += "=" * (4 - padding)
