@@ -76,65 +76,66 @@ def soup_get(url: str, delay: float = REQUEST_DELAY) -> BeautifulSoup:
 # PROPSTACK IFRAME FUNCTIONS
 # ===========================================================================
 
-def extract_property_tokens_from_page(soup: BeautifulSoup) -> List[Tuple[str, str, str]]:
-    """Extrahiere property_tokens, Titel und iframe-URLs aus der Seite"""
-    properties = []
+def collect_detail_page_links() -> List[str]:
+    """Sammle Links zu Detailseiten von der Übersichtsseite"""
+    print(f"[LIST] Hole {LIST_URL}")
+    soup = soup_get(LIST_URL)
     
-    # Suche alle iframes mit Propstack-URLs
-    for iframe in soup.find_all("iframe"):
-        src = iframe.get("src", "")
-        if "landingpage.immobilien" in src and "/public/exposee/" in src:
-            # Format: https://alainreinicke.landingpage.immobilien/public/exposee/TITEL-SLUG/BASE64_TOKEN
-            parts = src.split("/public/exposee/")
-            if len(parts) > 1:
-                rest = parts[1]
-                # Entferne trailing /
-                rest = rest.rstrip("/")
-                
-                # Split by last /
-                last_slash = rest.rfind("/")
-                if last_slash == -1:
-                    # Kein Slash, dann ist alles nach exposee/ der Token mit Titel davor
-                    # Format: titel-slug-BASE64
-                    # Suche nach dem letzten - vor dem Base64
-                    parts_by_dash = rest.split("-")
-                    # Base64 ist der letzte Teil nach dem letzten Dash vor dem Token
-                    # Oder einfacher: Alles nach dem letzten Wort ist der Token
-                    
-                    # Einfachere Methode: Token ist nach dem letzten Dash
-                    # Aber Titel kann auch Dashes haben!
-                    # Format ist: titel-mit-dashes-eyJz...
-                    # Base64 startet mit eyJ
-                    
-                    import re
-                    match = re.search(r"(.*?)-(eyJ[A-Za-z0-9+/=]+)$", rest)
-                    if match:
-                        titel_slug = match.group(1)
-                        token_b64 = match.group(2)
-                    else:
-                        continue
-                else:
-                    titel_slug = rest[:last_slash]
-                    token_b64 = rest[last_slash+1:]
-                
-                try:
-                    # Dekodiere Token
-                    # Füge Padding hinzu falls nötig
-                    padding = len(token_b64) % 4
-                    if padding:
-                        token_b64 += "=" * (4 - padding)
-                    
-                    decoded = base64.b64decode(token_b64).decode('utf-8')
-                    token_data = json.loads(decoded)
-                    property_token = token_data.get("property_token", "")
-                    
-                    if property_token:
-                        properties.append((property_token, titel_slug, src))
-                        print(f"[DEBUG] Found: {titel_slug[:40]} | Token: {property_token[:20]}...")
-                except Exception as e:
-                    print(f"[DEBUG] Failed to decode token from {rest[:50]}: {e}")
+    detail_links = []
     
-    return properties
+    # Suche nach Links zu Immobilien-Detailseiten
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        text = a.get_text(strip=True).lower()
+        
+        # Filter: Links die zu Immobilien-Details führen
+        # Typische Muster: /grundstueck-in-..., /einfamilienhaus-..., etc.
+        # Oder: Links mit "Exposé" Text
+        if any(pattern in href.lower() for pattern in [
+            "/grundstueck",
+            "/einfamilienhaus",
+            "/zweifamilienhaus",
+            "/mehrfamilienhaus",
+            "/wohnung",
+            "/haus",
+            "/villa",
+            "/doppelhaus"
+        ]) or "exposé" in text or "expose" in text:
+            
+            # Mache URL absolut
+            full_url = urljoin(BASE, href)
+            
+            # Entferne Anker und Query-Parameter
+            full_url = full_url.split("#")[0].split("?")[0]
+            
+            # Dedupliziere
+            if full_url not in detail_links and full_url != LIST_URL:
+                detail_links.append(full_url)
+                print(f"[DEBUG] Found detail page: {full_url.split('/')[-1]}")
+    
+    print(f"\n[LIST] Gefunden: {len(detail_links)} Detailseiten")
+    return detail_links
+
+def extract_iframe_from_detail_page(detail_url: str) -> Optional[str]:
+    """Extrahiere Propstack iframe-URL von einer Detailseite"""
+    print(f"[DETAIL] Lade {detail_url.split('/')[-1]}")
+    
+    try:
+        soup = soup_get(detail_url, delay=1.0)
+        
+        # Suche nach Propstack iframe
+        for iframe in soup.find_all("iframe"):
+            src = iframe.get("src", "")
+            if "landingpage.immobilien" in src and "/public/exposee/" in src:
+                print(f"[DEBUG] iframe gefunden!")
+                return src
+        
+        print(f"[WARN] Kein Propstack iframe gefunden")
+        return None
+        
+    except Exception as e:
+        print(f"[ERROR] Fehler beim Laden der Detailseite: {e}")
+        return None
 
 def get_propstack_property_data_from_iframe(iframe_url: str) -> dict:
     """Hole Immobilien-Daten direkt aus Propstack iframe"""
@@ -237,37 +238,63 @@ def get_propstack_property_data_from_iframe(iframe_url: str) -> dict:
 
 def collect_all_properties() -> List[dict]:
     """Sammle alle Immobilien von der Website"""
-    print(f"[LIST] Hole {LIST_URL}")
-    soup = soup_get(LIST_URL)
     
-    # Extrahiere alle property_tokens aus iframes
-    properties_data = extract_property_tokens_from_page(soup)
+    # Schritt 1: Sammle Links zu Detailseiten
+    detail_links = collect_detail_page_links()
     
-    print(f"[LIST] Gefunden: {len(properties_data)} Immobilien")
-    
-    if not properties_data:
-        print("[WARN] Keine Propstack-iframes gefunden!")
+    if not detail_links:
+        print("[WARN] Keine Detailseiten gefunden!")
         print("[INFO] Prüfe ob die Website-Struktur sich geändert hat")
         return []
     
-    # Hole Daten für jede Immobilie
+    # Schritt 2: Für jede Detailseite, extrahiere iframe und hole Daten
     all_properties = []
-    for i, (prop_token, titel_slug, iframe_url) in enumerate(properties_data, 1):
-        print(f"\n[SCRAPE] {i}/{len(properties_data)} | {titel_slug[:40]}")
+    
+    for i, detail_url in enumerate(detail_links, 1):
+        print(f"\n[SCRAPE] {i}/{len(detail_links)}")
         
         try:
-            # Lade iframe direkt
+            # Finde iframe auf der Detailseite
+            iframe_url = extract_iframe_from_detail_page(detail_url)
+            
+            if not iframe_url:
+                print(f"  ⚠️  Überspringe - kein iframe gefunden")
+                continue
+            
+            # Lade Daten aus dem iframe
             prop_data = get_propstack_property_data_from_iframe(iframe_url)
+            
             if prop_data:
-                # Füge Metadaten hinzu
-                prop_data["objektnummer"] = prop_token
-                prop_data["url"] = f"{BASE}/{titel_slug}"
+                # Extrahiere Objektnummer aus iframe-URL
+                import re
+                match = re.search(r"(eyJ[A-Za-z0-9+/=]+)", iframe_url)
+                if match:
+                    token_b64 = match.group(1)
+                    try:
+                        # Dekodiere Token
+                        padding = len(token_b64) % 4
+                        if padding:
+                            token_b64 += "=" * (4 - padding)
+                        decoded = base64.b64decode(token_b64).decode('utf-8')
+                        token_data = json.loads(decoded)
+                        prop_data["objektnummer"] = token_data.get("property_token", "")
+                    except:
+                        prop_data["objektnummer"] = detail_url.split("/")[-1]
+                else:
+                    prop_data["objektnummer"] = detail_url.split("/")[-1]
+                
+                # URL der Detailseite
+                prop_data["url"] = detail_url
+                
                 all_properties.append(prop_data)
                 
                 # Zeige Vorschau
                 print(f"  → {prop_data.get('kategorie', 'N/A'):8} | {prop_data.get('titel', 'Unbekannt')[:50]} | {prop_data.get('ort', 'N/A')} | Preis: {prop_data.get('preis', 'N/A')}")
+            else:
+                print(f"  ⚠️  Keine Daten extrahiert")
+                
         except Exception as e:
-            print(f"[ERROR] {e}")
+            print(f"  ❌ Fehler: {e}")
             continue
     
     return all_properties
