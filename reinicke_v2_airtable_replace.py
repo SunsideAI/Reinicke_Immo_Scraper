@@ -151,6 +151,7 @@ def get_propstack_property_data_from_iframe(iframe_url: str) -> dict:
             "preis": "",
             "ort": "",
             "kategorie": "Kaufen",
+            "unterkategorie": "",
             "bild_url": "",
         }
         
@@ -163,8 +164,27 @@ def get_propstack_property_data_from_iframe(iframe_url: str) -> dict:
                     data["titel"] = text
                     break
         
+        # Unterkategorie aus Titel oder Text extrahieren
+        text_content = soup.get_text().lower()
+        titel_lower = data["titel"].lower()
+        
+        # Einfache Kategorien wie auf der Website
+        if any(kw in titel_lower or kw in text_content for kw in ["grundstück", "baugrundstück", "bauland"]):
+            data["unterkategorie"] = "Grundstück"
+        elif any(kw in titel_lower or kw in text_content for kw in ["gewerbe", "halle", "büro", "laden", "praxis"]):
+            data["unterkategorie"] = "Gewerbe"
+        elif any(kw in titel_lower or kw in text_content for kw in ["wohnung", "etw", "eigentumswohnung"]):
+            data["unterkategorie"] = "Wohnung"
+        elif any(kw in titel_lower or kw in text_content for kw in [
+            "haus", "einfamilienhaus", "efh", "zweifamilienhaus", "2fh", "mehrfamilienhaus", "mfh",
+            "doppelhaushälfte", "dhh", "reihenhaus", "villa", "bungalow"
+        ]):
+            data["unterkategorie"] = "Haus"
+        else:
+            # Fallback: Versuche aus Titel zu erraten
+            data["unterkategorie"] = "Haus"  # Default
+        
         # Preis - suche nach Preis-Pattern
-        text_content = soup.get_text()
         price_matches = RE_PRICE.findall(text_content)
         if price_matches:
             # Nehme den höchsten Preis (wahrscheinlich Kaufpreis)
@@ -174,11 +194,13 @@ def get_propstack_property_data_from_iframe(iframe_url: str) -> dict:
                     clean = p.replace(".", "").replace(",", ".")
                     val = float(clean)
                     if val > 1000:  # Filter kleine Zahlen
-                        prices.append(p + " €")
+                        prices.append((val, p + " €"))
                 except:
                     pass
             if prices:
-                data["preis"] = prices[0]
+                # Sortiere und nimm höchsten
+                prices.sort(reverse=True)
+                data["preis"] = prices[0][1]
         
         # PLZ/Ort
         match = RE_PLZ_ORT.search(text_content)
@@ -199,31 +221,88 @@ def get_propstack_property_data_from_iframe(iframe_url: str) -> dict:
         if paragraphs:
             data["beschreibung"] = "\n\n".join(paragraphs)[:5000]
         
-        # Bild - suche erstes größeres Bild
-        for img in soup.find_all("img"):
-            src = img.get("src", "")
-            alt = img.get("alt", "").lower()
-            
-            # Ignoriere Logos, Icons
-            if any(skip in src.lower() for skip in ["logo", "icon", "favicon"]):
-                continue
-            if any(skip in alt for skip in ["logo", "icon"]):
-                continue
-            
-            # Ignoriere sehr kleine Bilder
-            width = img.get("width", "")
-            try:
-                if width and int(width) < 100:
+        # BILD - VERBESSERTE EXTRAKTION
+        # Strategie: Mehrere Ansätze ausprobieren bis ein Bild gefunden wird
+        
+        # Ansatz 1: Suche nach img mit bestimmten Klassen
+        for class_name in ["property-image", "object-image", "main-image", "gallery-image", "slider-image"]:
+            img = soup.find("img", class_=lambda x: x and class_name in str(x).lower())
+            if img:
+                src = img.get("src", "")
+                if src and not any(skip in src.lower() for skip in ["logo", "icon", "favicon", "placeholder"]):
+                    data["bild_url"] = src if src.startswith("http") else urljoin(iframe_url, src)
+                    print(f"[DEBUG] Bild gefunden (Klasse: {class_name})")
+                    break
+        
+        # Ansatz 2: Suche in srcset (oft höhere Auflösungen)
+        if not data["bild_url"]:
+            for img in soup.find_all("img"):
+                srcset = img.get("srcset", "")
+                if srcset:
+                    # Parse srcset und nimm größtes Bild
+                    parts = [s.strip().split()[0] for s in srcset.split(",") if s.strip()]
+                    if parts:
+                        src = parts[-1]  # Größte Auflösung
+                        if not any(skip in src.lower() for skip in ["logo", "icon", "favicon"]):
+                            data["bild_url"] = src if src.startswith("http") else urljoin(iframe_url, src)
+                            print(f"[DEBUG] Bild gefunden (srcset)")
+                            break
+        
+        # Ansatz 3: Erstes großes Bild (width > 200 oder ohne width)
+        if not data["bild_url"]:
+            for img in soup.find_all("img"):
+                src = img.get("src", "")
+                alt = img.get("alt", "").lower()
+                width = img.get("width", "")
+                
+                # Ignoriere Logos, Icons
+                if any(skip in src.lower() for skip in ["logo", "icon", "favicon"]):
                     continue
-            except:
-                pass
-            
-            if src:
-                data["bild_url"] = src if src.startswith("http") else urljoin(iframe_url, src)
-                break
+                if any(skip in alt for skip in ["logo", "icon"]):
+                    continue
+                
+                # Prüfe Größe
+                is_large = True
+                if width:
+                    try:
+                        if int(width) < 200:
+                            is_large = False
+                    except:
+                        pass
+                
+                if src and is_large:
+                    data["bild_url"] = src if src.startswith("http") else urljoin(iframe_url, src)
+                    print(f"[DEBUG] Bild gefunden (erstes großes img)")
+                    break
+        
+        # Ansatz 4: Suche in background-image CSS
+        if not data["bild_url"]:
+            for elem in soup.find_all(style=True):
+                style = elem.get("style", "")
+                if "background-image" in style:
+                    import re
+                    match = re.search(r'url\(["\']?([^"\']+)["\']?\)', style)
+                    if match:
+                        url = match.group(1)
+                        if not any(skip in url.lower() for skip in ["logo", "icon"]):
+                            data["bild_url"] = url if url.startswith("http") else urljoin(iframe_url, url)
+                            print(f"[DEBUG] Bild gefunden (background-image)")
+                            break
+        
+        # Ansatz 5: Einfach das erste img-Tag (Fallback)
+        if not data["bild_url"]:
+            img = soup.find("img")
+            if img:
+                src = img.get("src", "")
+                if src:
+                    data["bild_url"] = src if src.startswith("http") else urljoin(iframe_url, src)
+                    print(f"[DEBUG] Bild gefunden (Fallback: erstes img)")
+        
+        if not data["bild_url"]:
+            print(f"[WARN] ⚠️  KEIN Bild gefunden!")
         
         # Kategorie aus Text erkennen
-        if any(word in text_content.lower() for word in ["miete", "vermietet", "zu vermieten", "mietpreis"]):
+        if any(word in text_content for word in ["miete", "vermietet", "zu vermieten", "mietpreis"]):
             data["kategorie"] = "Mieten"
         
         return data
@@ -289,7 +368,8 @@ def collect_all_properties() -> List[dict]:
                 all_properties.append(prop_data)
                 
                 # Zeige Vorschau
-                print(f"  → {prop_data.get('kategorie', 'N/A'):8} | {prop_data.get('titel', 'Unbekannt')[:50]} | {prop_data.get('ort', 'N/A')} | Preis: {prop_data.get('preis', 'N/A')}")
+                bild_status = "✅" if prop_data.get("bild_url") else "❌"
+                print(f"  → {prop_data.get('kategorie', 'N/A'):8} | {prop_data.get('unterkategorie', 'N/A'):20} | {prop_data.get('titel', 'Unbekannt')[:40]} | Bild: {bild_status}")
             else:
                 print(f"  ⚠️  Keine Daten extrahiert")
                 
@@ -313,6 +393,7 @@ def make_record(prop: dict) -> dict:
     record = {
         "Titel": prop.get("titel", "Unbekannt"),
         "Kategorie": prop.get("kategorie", "Kaufen"),
+        "Unterkategorie": prop.get("unterkategorie", "Sonstiges"),
         "Webseite": prop.get("url", ""),
         "Objektnummer": prop.get("objektnummer", ""),
         "Beschreibung": prop.get("beschreibung", ""),
@@ -438,7 +519,7 @@ def run():
     
     # CSV speichern
     csv_file = "reinicke_immobilien.csv"
-    cols = ["Titel", "Kategorie", "Webseite", "Objektnummer", "Beschreibung", "Bild", "Preis", "Standort"]
+    cols = ["Titel", "Kategorie", "Unterkategorie", "Webseite", "Objektnummer", "Beschreibung", "Bild", "Preis", "Standort"]
     with open(csv_file, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=cols)
         w.writeheader()
