@@ -241,10 +241,29 @@ def get_propstack_property_data_from_iframe(iframe_url: str) -> dict:
                 prices.sort(reverse=True)
                 data["preis"] = prices[0][1]
         
-        # PLZ/Ort
-        match = RE_PLZ_ORT.search(text_content)
+        # PLZ/Ort - mit mehreren Ansätzen
+        text_content_full = soup.get_text()
+        
+        # Ansatz 1: Standard PLZ-Pattern
+        match = RE_PLZ_ORT.search(text_content_full)
         if match:
             data["ort"] = f"{match.group(1)} {match.group(2).strip()}"
+        
+        # Ansatz 2: Suche in Meta-Tags oder speziellen Feldern
+        if not data["ort"]:
+            for meta in soup.find_all("meta"):
+                content = meta.get("content", "")
+                match = RE_PLZ_ORT.search(content)
+                if match:
+                    data["ort"] = f"{match.group(1)} {match.group(2).strip()}"
+                    break
+        
+        # Ansatz 3: Suche nach "in STADT" Pattern
+        if not data["ort"]:
+            import re
+            match = re.search(r'\bin\s+(\d{5})\s+([A-ZÄÖÜ][a-zäöüß\-]+)', text_content_full)
+            if match:
+                data["ort"] = f"{match.group(1)} {match.group(2)}"
         
         # Beschreibung - sammle Textabschnitte
         paragraphs = []
