@@ -41,6 +41,9 @@ AIRTABLE_TOKEN = os.getenv("AIRTABLE_TOKEN", "")
 AIRTABLE_BASE = os.getenv("AIRTABLE_BASE", "")
 AIRTABLE_TABLE_ID = os.getenv("AIRTABLE_TABLE_ID", "")
 
+# OpenAI für Kurzbeschreibung
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+
 # SYNC-MODUS
 # True  = Lösche ALLES in Airtable und ersetze mit neuen Daten
 # False = Update/Create/Delete nur geänderte Records (intelligent)
@@ -76,6 +79,239 @@ def soup_get(url: str, delay: float = REQUEST_DELAY) -> BeautifulSoup:
     r = requests.get(url, headers=headers, timeout=30)
     r.raise_for_status()
     return BeautifulSoup(r.text, "lxml")
+
+# ===========================================================================
+# GPT KURZBESCHREIBUNG MIT CACHING
+# ===========================================================================
+
+# Cache für existierende Kurzbeschreibungen (wird beim Start gefüllt)
+KURZBESCHREIBUNG_CACHE = {}  # {objektnummer: kurzbeschreibung}
+
+def load_kurzbeschreibung_cache():
+    """Lädt existierende Kurzbeschreibungen aus Airtable in den Cache"""
+    global KURZBESCHREIBUNG_CACHE
+    
+    if not (AIRTABLE_TOKEN and AIRTABLE_BASE and airtable_table_segment()):
+        print("[CACHE] Airtable nicht konfiguriert - Cache leer")
+        return
+    
+    # Im FULL_REPLACE Modus macht Caching keinen Sinn
+    if FULL_REPLACE:
+        print("[CACHE] FULL_REPLACE Modus - Cache übersprungen")
+        return
+    
+    try:
+        all_ids, all_fields = airtable_list_all()
+        for fields in all_fields:
+            obj_nr = fields.get("Objektnummer", "").strip()
+            kurzbeschreibung = fields.get("Kurzbeschreibung", "").strip()
+            if obj_nr and kurzbeschreibung:
+                KURZBESCHREIBUNG_CACHE[obj_nr] = kurzbeschreibung
+        
+        print(f"[CACHE] {len(KURZBESCHREIBUNG_CACHE)} Kurzbeschreibungen aus Airtable geladen")
+    except Exception as e:
+        print(f"[CACHE] Fehler beim Laden: {e}")
+
+def get_cached_kurzbeschreibung(objektnummer: str) -> str:
+    """Holt Kurzbeschreibung aus Cache wenn vorhanden"""
+    return KURZBESCHREIBUNG_CACHE.get(objektnummer, "")
+
+# Einheitliche Feldstruktur für Kurzbeschreibung
+KURZBESCHREIBUNG_FIELDS = [
+    "Objekttyp",
+    "Zimmer", 
+    "Schlafzimmer",
+    "Wohnfläche",
+    "Grundstück",
+    "Baujahr",
+    "Kategorie",
+    "Preis",
+    "Standort",
+    "Energieeffizienz",
+    "Besonderheiten"
+]
+
+def normalize_kurzbeschreibung(gpt_output: str, scraped_data: dict) -> str:
+    """
+    Normalisiert die GPT-Ausgabe und füllt fehlende Felder mit Scrape-Daten oder '-'.
+    Stellt einheitliche Struktur sicher.
+    """
+    # Parse GPT Output in Dictionary
+    parsed = {}
+    for line in gpt_output.strip().split("\n"):
+        if ":" in line:
+            key, value = line.split(":", 1)
+            key = key.strip()
+            value = value.strip()
+            if value and value != "-":
+                parsed[key] = value
+    
+    # Mapping von Scrape-Feldern zu Kurzbeschreibung-Feldern
+    scrape_mapping = {
+        "Zimmer": "zimmer",
+        "Wohnfläche": "wohnflaeche", 
+        "Grundstück": "grundstueck",
+        "Baujahr": "baujahr",
+        "Kategorie": "kategorie",
+        "Preis": "preis",
+        "Standort": "standort",
+    }
+    
+    # Fülle fehlende Felder aus Scrape-Daten
+    for field, scrape_key in scrape_mapping.items():
+        if field not in parsed or not parsed[field] or parsed[field] == "-":
+            scrape_value = scraped_data.get(scrape_key, "")
+            if scrape_value:
+                # Formatiere Preis
+                if field == "Preis" and scrape_value:
+                    try:
+                        preis_num = float(str(scrape_value).replace(".", "").replace(",", ".").replace("€", "").strip())
+                        parsed[field] = f"{int(preis_num):,} €".replace(",", ".")
+                    except:
+                        parsed[field] = str(scrape_value)
+                # Formatiere Wohnfläche
+                elif field == "Wohnfläche" and scrape_value:
+                    if "m²" not in str(scrape_value):
+                        parsed[field] = f"{scrape_value} m²"
+                    else:
+                        parsed[field] = str(scrape_value)
+                # Formatiere Grundstück
+                elif field == "Grundstück" and scrape_value:
+                    if "m²" not in str(scrape_value):
+                        parsed[field] = f"{scrape_value} m²"
+                    else:
+                        parsed[field] = str(scrape_value)
+                else:
+                    parsed[field] = str(scrape_value)
+    
+    # Baue einheitliche Ausgabe mit allen Feldern
+    output_lines = []
+    for field in KURZBESCHREIBUNG_FIELDS:
+        value = parsed.get(field, "-")
+        if not value or value.strip() == "":
+            value = "-"
+        output_lines.append(f"{field}: {value}")
+    
+    return "\n".join(output_lines)
+
+def generate_kurzbeschreibung(beschreibung: str, titel: str, kategorie: str, preis: str, ort: str,
+                               zimmer: str = "", wohnflaeche: str = "", grundstueck: str = "", baujahr: str = "",
+                               objektnummer: str = "") -> str:
+    """
+    Generiert eine strukturierte Kurzbeschreibung mit GPT für die KI-Suche.
+    Format ist optimiert für Regex/KI-Matching im Chatbot.
+    Fehlende Felder werden aus Scrape-Daten ergänzt oder mit '-' gefüllt.
+    
+    OPTIMIERUNG: Wenn bereits eine Kurzbeschreibung in Airtable existiert, wird diese verwendet.
+    """
+    
+    # CACHE CHECK: Wenn bereits vorhanden, nicht neu generieren!
+    if objektnummer:
+        cached = get_cached_kurzbeschreibung(objektnummer)
+        if cached:
+            print(f"[CACHE] Kurzbeschreibung aus Cache verwendet für {objektnummer[:30]}...")
+            return cached
+    
+    # Scrape-Daten für Fallback sammeln
+    scraped_data = {
+        "kategorie": kategorie,
+        "preis": preis,
+        "standort": ort,
+        "zimmer": zimmer,
+        "wohnflaeche": wohnflaeche,
+        "grundstueck": grundstueck,
+        "baujahr": baujahr,
+    }
+    
+    if not OPENAI_API_KEY:
+        print("[WARN] OPENAI_API_KEY nicht gesetzt - erstelle Kurzbeschreibung aus Scrape-Daten")
+        # Fallback: Erstelle Kurzbeschreibung nur aus Scrape-Daten
+        return normalize_kurzbeschreibung("", scraped_data)
+    
+    # Baue zusätzliche Daten-Sektion für GPT
+    zusatz_daten = []
+    if zimmer:
+        zusatz_daten.append(f"Zimmer: {zimmer}")
+    if wohnflaeche:
+        zusatz_daten.append(f"Wohnfläche: {wohnflaeche}")
+    if grundstueck:
+        zusatz_daten.append(f"Grundstück: {grundstueck}")
+    if baujahr:
+        zusatz_daten.append(f"Baujahr: {baujahr}")
+    
+    zusatz_text = "\n".join(zusatz_daten) if zusatz_daten else "Keine zusätzlichen Daten"
+    
+    prompt = f"""Analysiere diese Immobilienanzeige und erstelle eine strukturierte Kurzbeschreibung für eine Suchfunktion.
+
+TITEL: {titel}
+KATEGORIE: {kategorie}
+PREIS: {preis if preis else 'Nicht angegeben'}
+STANDORT: {ort if ort else 'Nicht angegeben'}
+
+ZUSÄTZLICHE DATEN (aus Scraping):
+{zusatz_text}
+
+BESCHREIBUNG:
+{beschreibung[:3000]}
+
+Erstelle eine Kurzbeschreibung EXAKT in diesem Format (ALLE Felder müssen vorhanden sein, nutze "-" wenn unbekannt):
+
+Objekttyp: [Einfamilienhaus/Mehrfamilienhaus/Eigentumswohnung/Baugrundstück/Reihenhaus/Doppelhaushälfte/Wohnung/etc. oder "-"]
+Zimmer: [Anzahl oder "-"]
+Schlafzimmer: [Anzahl oder "-"]
+Wohnfläche: [X m² oder "-"]
+Grundstück: [X m² oder "-"]
+Baujahr: [Jahr oder "-"]
+Kategorie: [Kaufen/Mieten]
+Preis: [Preis in € oder "-"]
+Standort: [PLZ Ort oder "-"]
+Energieeffizienz: [Klasse A+ bis H oder "-"]
+Besonderheiten: [Kommaseparierte Liste oder "-"]
+
+WICHTIG: 
+- ALLE 11 Felder MÜSSEN in der Ausgabe sein
+- Nutze "-" für unbekannte/fehlende Werte
+- Nutze die ZUSÄTZLICHEN DATEN wenn die Beschreibung keine Info enthält
+- Zahlen ohne "ca." (z.B. "180 m²" statt "ca. 180 m²")
+- Preis im Format "XXX.XXX €" """
+
+    try:
+        headers = {
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
+            "model": "gpt-4o-mini",
+            "messages": [
+                {"role": "system", "content": "Du bist ein Experte für Immobilienanalyse. Erstelle präzise, strukturierte Kurzbeschreibungen. Halte dich EXAKT an das vorgegebene Format."},
+                {"role": "user", "content": prompt}
+            ],
+            "max_tokens": 500,
+            "temperature": 0.1
+        }
+        
+        response = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=30
+        )
+        response.raise_for_status()
+        
+        result = response.json()
+        gpt_output = result["choices"][0]["message"]["content"].strip()
+        
+        # Normalisiere und fülle fehlende Felder
+        kurzbeschreibung = normalize_kurzbeschreibung(gpt_output, scraped_data)
+        
+        print(f"[GPT] Kurzbeschreibung generiert und normalisiert ({len(kurzbeschreibung)} Zeichen)")
+        return kurzbeschreibung
+        
+    except Exception as e:
+        print(f"[ERROR] GPT Kurzbeschreibung fehlgeschlagen: {e}")
+        # Fallback: Erstelle aus Scrape-Daten
+        return normalize_kurzbeschreibung("", scraped_data)
 
 # ===========================================================================
 # PROPSTACK IFRAME FUNCTIONS
@@ -213,6 +449,10 @@ def get_propstack_property_data_from_iframe(iframe_url: str) -> dict:
             "kategorie": "Kaufen",  # Default, wird von Übersichtsseite überschrieben
             "unterkategorie": "Haus",  # Default, wird von Übersichtsseite überschrieben
             "bild_url": "",
+            "zimmer": "",
+            "wohnflaeche": "",
+            "grundstueck": "",
+            "baujahr": "",
         }
         
         # Titel - suche h1, h2 oder title
@@ -264,7 +504,6 @@ def get_propstack_property_data_from_iframe(iframe_url: str) -> dict:
                 data["preis"] = prices[0][1]
         
         # SPEZIALFALL: Mietobjekte - Warmmiete/Kaltmiete explizit suchen
-        import re
         miete_pattern = re.compile(r'(?:Warmmiete|Kaltmiete|Miete)\s*[:.]?\s*([\d.,]+)\s*€', re.IGNORECASE)
         miete_matches = miete_pattern.findall(text_content_full)
         
@@ -285,8 +524,6 @@ def get_propstack_property_data_from_iframe(iframe_url: str) -> dict:
                     pass
         
         # PLZ/Ort - mit mehreren Ansätzen
-        # (text_content_full wurde bereits oben definiert)
-        
         # Ansatz 1: Standard PLZ-Pattern
         match = RE_PLZ_ORT.search(text_content_full)
         if match:
@@ -303,10 +540,30 @@ def get_propstack_property_data_from_iframe(iframe_url: str) -> dict:
         
         # Ansatz 3: Suche nach "in STADT" Pattern
         if not data["ort"]:
-            import re
             match = re.search(r'\bin\s+(\d{5})\s+([A-ZÄÖÜ][a-zäöüß\-]+)', text_content_full)
             if match:
                 data["ort"] = f"{match.group(1)} {match.group(2)}"
+        
+        # Zusätzliche Daten für Kurzbeschreibung extrahieren
+        # Zimmer
+        zimmer_match = re.search(r'(\d+)\s*Zimmer', text_content_full, re.IGNORECASE)
+        if zimmer_match:
+            data["zimmer"] = zimmer_match.group(1)
+        
+        # Wohnfläche
+        wohnflaeche_match = re.search(r'(?:ca\.\s*)?(\d+(?:[.,]\d+)?)\s*m²\s*(?:Wohnfläche|Wohnfl)', text_content_full, re.IGNORECASE)
+        if wohnflaeche_match:
+            data["wohnflaeche"] = wohnflaeche_match.group(1).replace(",", ".")
+        
+        # Grundstück
+        grundstueck_match = re.search(r'(?:ca\.\s*)?(\d+(?:[.,]\d+)?)\s*m²\s*(?:Grundstück|Grundst)', text_content_full, re.IGNORECASE)
+        if grundstueck_match:
+            data["grundstueck"] = grundstueck_match.group(1).replace(",", ".")
+        
+        # Baujahr
+        baujahr_match = re.search(r'Baujahr[:\s]+(\d{4})', text_content_full, re.IGNORECASE)
+        if baujahr_match:
+            data["baujahr"] = baujahr_match.group(1)
         
         # Beschreibung - sammle Textabschnitte
         paragraphs = []
@@ -381,7 +638,6 @@ def get_propstack_property_data_from_iframe(iframe_url: str) -> dict:
             for elem in soup.find_all(style=True):
                 style = elem.get("style", "")
                 if "background-image" in style:
-                    import re
                     match = re.search(r'url\(["\']?([^"\']+)["\']?\)', style)
                     if match:
                         url = match.group(1)
@@ -401,9 +657,6 @@ def get_propstack_property_data_from_iframe(iframe_url: str) -> dict:
         
         if not data["bild_url"]:
             print(f"[WARN] ⚠️  KEIN Bild gefunden!")
-        
-        # Kategorie/Unterkategorie werden von Übersichtsseite überschrieben
-        # Keine Erkennung mehr hier nötig
         
         return data
         
@@ -482,7 +735,6 @@ def collect_all_properties() -> List[dict]:
                         prop_data["unterkategorie"] = "Wohnung"  # Default für Mietobjekte
                 
                 # Extrahiere Objektnummer aus iframe-URL
-                import re
                 match = re.search(r"(eyJ[A-Za-z0-9+/=]+)", iframe_url)
                 if match:
                     token_b64 = match.group(1)
@@ -526,6 +778,20 @@ def make_record(prop: dict) -> dict:
         except:
             pass
     
+    # Kurzbeschreibung via GPT generieren (mit Cache-Check)
+    kurzbeschreibung = generate_kurzbeschreibung(
+        beschreibung=prop.get("beschreibung", ""),
+        titel=prop.get("titel", ""),
+        kategorie=prop.get("kategorie", "Kaufen"),
+        preis=prop.get("preis", ""),
+        ort=prop.get("ort", ""),
+        zimmer=prop.get("zimmer", ""),
+        wohnflaeche=prop.get("wohnflaeche", ""),
+        grundstueck=prop.get("grundstueck", ""),
+        baujahr=prop.get("baujahr", ""),
+        objektnummer=prop.get("objektnummer", "")
+    )
+    
     record = {
         "Titel": prop.get("titel", "Unbekannt"),
         "Kategorie": prop.get("kategorie", "Kaufen"),
@@ -533,6 +799,7 @@ def make_record(prop: dict) -> dict:
         "Webseite": prop.get("url", ""),
         "Objektnummer": prop.get("objektnummer", ""),
         "Beschreibung": prop.get("beschreibung", ""),
+        "Kurzbeschreibung": kurzbeschreibung,
         "Bild": prop.get("bild_url", ""),
         "Standort": prop.get("ort", ""),
     }
@@ -626,9 +893,15 @@ def unique_key(fields: dict) -> str:
     return f"hash:{hash(json.dumps(fields, sort_keys=True))}"
 
 def sanitize_record_for_airtable(record: dict, allowed_fields: set) -> dict:
+    # Felder die immer erlaubt sind (auch wenn sie in bestehenden Records leer sind)
+    ALWAYS_ALLOWED = {"Kurzbeschreibung"}
+    
     if not allowed_fields:
         return record
-    return {k: v for k, v in record.items() if k in allowed_fields}
+    
+    # Kombiniere allowed_fields mit ALWAYS_ALLOWED
+    all_allowed = allowed_fields | ALWAYS_ALLOWED
+    return {k: v for k, v in record.items() if k in all_allowed}
 
 def airtable_existing_fields() -> set:
     """Hole existierende Felder - DEAKTIVIERT um alle Felder zuzulassen"""
@@ -644,6 +917,10 @@ def airtable_existing_fields() -> set:
 def run():
     print("[REINICKE] Starte Scraper für alainreinickeimmobilien.de (Propstack)")
     
+    # OPTIMIERUNG: Lade existierende Kurzbeschreibungen aus Airtable
+    print("[INIT] Lade Kurzbeschreibungen-Cache aus Airtable...")
+    load_kurzbeschreibung_cache()
+    
     # Sammle alle Immobilien
     all_properties = collect_all_properties()
     
@@ -656,9 +933,9 @@ def run():
     
     # CSV speichern
     csv_file = "reinicke_immobilien.csv"
-    cols = ["Titel", "Kategorie", "Unterkategorie", "Webseite", "Objektnummer", "Beschreibung", "Bild", "Preis", "Standort"]
+    cols = ["Titel", "Kategorie", "Unterkategorie", "Webseite", "Objektnummer", "Beschreibung", "Kurzbeschreibung", "Bild", "Preis", "Standort"]
     with open(csv_file, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=cols)
+        w = csv.DictWriter(f, fieldnames=cols, extrasaction='ignore')
         w.writeheader()
         w.writerows(all_rows)
     print(f"\n[CSV] Gespeichert: {csv_file} ({len(all_rows)} Zeilen)")
