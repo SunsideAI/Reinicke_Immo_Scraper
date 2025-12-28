@@ -29,6 +29,8 @@ jobs:
           AIRTABLE_BASE: ${{ secrets.AIRTABLE_BASE }}
           AIRTABLE_TABLE_ID: ${{ secrets.AIRTABLE_TABLE_ID }}
           FULL_REPLACE: true  # Komplett ersetzen - verkaufte Immobilien werden entfernt
+          # 🤖 OpenAI für Kurzbeschreibung
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: python reinicke_v2_airtable_replace.py
       
       - name: Upload CSV Artifact
