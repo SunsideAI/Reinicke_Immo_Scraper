@@ -241,39 +241,51 @@ def generate_kurzbeschreibung(beschreibung: str, titel: str, kategorie: str, pre
     
     zusatz_text = "\n".join(zusatz_daten) if zusatz_daten else "Keine zusätzlichen Daten"
     
-    prompt = f"""Analysiere diese Immobilienanzeige und erstelle eine strukturierte Kurzbeschreibung für eine Suchfunktion.
-
+    prompt = f"""# Rolle
+Du bist ein präziser Immobilien-Datenanalyst und Parser. Deine Aufgabe ist es, aus unstrukturierten Immobilienanzeigen ausschließlich faktenbasierte, strukturierte Kurzbeschreibungen zu extrahieren, die für Such- und Filterfunktionen geeignet sind. Du arbeitest streng regelbasiert und formatgenau.
+# Aufgabe
+1. Analysiere die bereitgestellte Immobilienanzeige vollständig.
+2. Extrahiere alle eindeutig genannten, objektiven Fakten.
+3. Gib die strukturierte Kurzbeschreibung exakt im vorgegebenen Zeilenformat aus.
+4. Lasse Felder vollständig weg, zu denen keine eindeutigen Angaben vorhanden sind.
+# Eingabedaten
 TITEL: {titel}
 KATEGORIE: {kategorie}
-PREIS: {preis if preis else 'Nicht angegeben'}
-STANDORT: {ort if ort else 'Nicht angegeben'}
-
-ZUSÄTZLICHE DATEN (aus Scraping):
-{zusatz_text}
-
+PREIS: {preis}
+STANDORT: {ort}
 BESCHREIBUNG:
 {beschreibung[:3000]}
-
-Erstelle eine Kurzbeschreibung EXAKT in diesem Format (ALLE Felder müssen vorhanden sein, nutze "-" wenn unbekannt):
-
-Objekttyp: [Einfamilienhaus/Mehrfamilienhaus/Eigentumswohnung/Baugrundstück/Reihenhaus/Doppelhaushälfte/Wohnung/etc. oder "-"]
-Zimmer: [Anzahl oder "-"]
-Schlafzimmer: [Anzahl oder "-"]
-Wohnfläche: [X m² oder "-"]
-Grundstück: [X m² oder "-"]
-Baujahr: [Jahr oder "-"]
-Kategorie: [Kaufen/Mieten]
-Preis: [Preis in € oder "-"]
-Standort: [PLZ Ort oder "-"]
-Energieeffizienz: [Klasse A+ bis H oder "-"]
-Besonderheiten: [Kommaseparierte Liste oder "-"]
-
-WICHTIG: 
-- ALLE 11 Felder MÜSSEN in der Ausgabe sein
-- Nutze "-" für unbekannte/fehlende Werte
-- Nutze die ZUSÄTZLICHEN DATEN wenn die Beschreibung keine Info enthält
-- Zahlen ohne "ca." (z.B. "180 m²" statt "ca. 180 m²")
-- Preis im Format "XXX.XXX €" """
+# Ausgabeformat (verbindlich)
+Die Ausgabe muss exakt diesem Muster folgen. Jede Eigenschaft steht in einer eigenen Zeile. Keine Leerzeilen zwischen den Zeilen. Keine zusätzlichen Texte vor oder nach der Ausgabe.
+Objekttyp: [Einfamilienhaus | Mehrfamilienhaus | Eigentumswohnung | Baugrundstück | Reihenhaus | Doppelhaushälfte | Sonstiges]
+Baujahr: [Jahr]
+Wohnfläche: [Zahl in m²]
+Grundstück: [Zahl in m²]
+Zimmer: [Anzahl]
+Preis: [Zahl in €]
+Standort: [Ort oder PLZ Ort]
+Energieeffizienz: [Klasse]
+Besonderheiten: [kommaseparierte Liste]
+# Spezifikationen
+• Jede Zeile beginnt exakt mit dem Feldnamen und einem Doppelpunkt.
+• Nach jeder Zeile folgt ein Zeilenumbruch (newline).
+• Es darf niemals mehr als ein Feld pro Zeile stehen.
+• Verwende ausschließlich Informationen, die explizit in den Eingabedaten enthalten sind.
+• Keine Interpretationen, keine Vermutungen, keine Ergänzungen.
+• Verwende ausschließlich arabische Ziffern.
+• Einheiten exakt wie folgt anhängen:
+  – Wohnfläche und Grundstück: " m²"
+  – Preis: " €"
+• Wenn ein Feld nicht eindeutig ermittelbar ist, lasse die gesamte Zeile weg.
+• Keine Leerzeilen, keine Aufzählungszeichen, keine Markdown-Formatierung.
+# Kontext
+Die strukturierte Kurzbeschreibung wird automatisiert weiterverarbeitet (z. B. in Airtable, Voiceflow oder einer Immobiliensuche). Ein zeilenstabiles Format ist erforderlich, damit jede Eigenschaft zuverlässig ausgelesen und indexiert werden kann, sofern Sie vorhanden ist.
+# Notizen
+• Reihenfolge der Zeilen exakt wie im Ausgabeformat.
+• "Besonderheiten" nur dann ausgeben, wenn mindestens ein Merkmal explizit genannt ist.
+• Verwende nur die vorgegebenen Feldnamen, keine Abwandlungen.
+• Gib ausschließlich die strukturierte Kurzbeschreibung aus. Keine zusätzlichen Texte vor oder nach der Ausgabe.
+• Wenn ein Feld nicht eindeutig ermittelbar ist, lasse die gesamte Zeile weg. """
 
     try:
         headers = {
