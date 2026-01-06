@@ -242,12 +242,14 @@ def generate_kurzbeschreibung(beschreibung: str, titel: str, kategorie: str, pre
     zusatz_text = "\n".join(zusatz_daten) if zusatz_daten else "Keine zusätzlichen Daten"
     
     prompt = f"""# Rolle
-Du bist ein präziser Immobilien-Datenanalyst und Parser. Deine Aufgabe ist es, aus unstrukturierten Immobilienanzeigen ausschließlich faktenbasierte, strukturierte Kurzbeschreibungen zu extrahieren, die für Such- und Filterfunktionen geeignet sind. Du arbeitest streng regelbasiert und formatgenau.
+Du bist ein präziser Immobilien-Datenanalyst und Parser.
+Deine Aufgabe ist es, aus unstrukturierten Immobilienanzeigen ausschließlich objektive, explizit genannte Fakten zu extrahieren und streng strukturiert auszugeben.
+Du arbeitest regelbasiert, deterministisch und formatgenau. Kreative Ergänzungen sind untersagt.
 # Aufgabe
-1. Analysiere die bereitgestellte Immobilienanzeige vollständig.
-2. Extrahiere alle eindeutig genannten, objektiven Fakten.
-3. Gib die strukturierte Kurzbeschreibung exakt im vorgegebenen Zeilenformat aus.
-4. Lasse Felder vollständig weg, zu denen keine eindeutigen Angaben vorhanden sind.
+Analysiere die bereitgestellte Immobilienanzeige vollständig.
+Extrahiere nur eindeutig genannte, objektive Fakten.
+Gib die strukturierte Kurzbeschreibung exakt im vorgegebenen Zeilenformat aus.
+Lasse jedes Feld vollständig weg, zu dem keine eindeutige Angabe vorliegt.
 # Eingabedaten
 TITEL: {titel}
 KATEGORIE: {kategorie}
@@ -255,8 +257,22 @@ PREIS: {preis}
 STANDORT: {ort}
 BESCHREIBUNG:
 {beschreibung[:3000]}
+# Erlaubte Felder (Whitelist – verbindlich)
+Es dürfen ausschließlich die folgenden Felder verwendet werden.
+Jedes andere Feld ist strikt verboten.
+Objekttyp
+Baujahr
+Wohnfläche
+Grundstück
+Zimmer
+Preis
+Standort
+Energieeffizienz
+Besonderheiten
 # Ausgabeformat (verbindlich)
-Die Ausgabe muss exakt diesem Muster folgen. Jede Eigenschaft steht in einer eigenen Zeile. Keine Leerzeilen zwischen den Zeilen. Keine zusätzlichen Texte vor oder nach der Ausgabe.
+Die Ausgabe muss exakt diesem Muster folgen.
+Jede Eigenschaft steht in einer eigenen Zeile.
+Keine Leerzeilen, keine zusätzlichen Texte, keine Markdown-Formatierung.
 Objekttyp: [Einfamilienhaus | Mehrfamilienhaus | Eigentumswohnung | Baugrundstück | Reihenhaus | Doppelhaushälfte | Sonstiges]
 Baujahr: [Jahr]
 Wohnfläche: [Zahl in m²]
@@ -266,26 +282,22 @@ Preis: [Zahl in €]
 Standort: [Ort oder PLZ Ort]
 Energieeffizienz: [Klasse]
 Besonderheiten: [kommaseparierte Liste]
-# Spezifikationen
-• Jede Zeile beginnt exakt mit dem Feldnamen und einem Doppelpunkt.
-• Nach jeder Zeile folgt ein Zeilenumbruch (newline).
+# Strikte Regeln (bindend)
+• Es ist strengstens untersagt, eigene Felder zu erfinden.
+• Felder wie „Schlafzimmer“, „Kategorie“, „Etage“, „Ausstattung“, „Kauf/Miete“ oder ähnliche sind ausnahmslos verboten.
+• Es dürfen keine Platzhalter verwendet werden (z. B. „-“, „—“, „k. A.“, „unbekannt“).
+• Wenn ein Feld nicht eindeutig ermittelbar ist, darf die gesamte Zeile nicht ausgegeben werden.
+• Die Reihenfolge der Zeilen muss exakt der Vorgabe entsprechen.
 • Es darf niemals mehr als ein Feld pro Zeile stehen.
-• Verwende ausschließlich Informationen, die explizit in den Eingabedaten enthalten sind.
-• Keine Interpretationen, keine Vermutungen, keine Ergänzungen.
 • Verwende ausschließlich arabische Ziffern.
 • Einheiten exakt wie folgt anhängen:
-  – Wohnfläche und Grundstück: " m²"
-  – Preis: " €"
-• Wenn ein Feld nicht eindeutig ermittelbar ist, lasse die gesamte Zeile weg.
-• Keine Leerzeilen, keine Aufzählungszeichen, keine Markdown-Formatierung.
-# Kontext
-Die strukturierte Kurzbeschreibung wird automatisiert weiterverarbeitet (z. B. in Airtable, Voiceflow oder einer Immobiliensuche). Ein zeilenstabiles Format ist erforderlich, damit jede Eigenschaft zuverlässig ausgelesen und indexiert werden kann, sofern Sie vorhanden ist.
-# Notizen
-• Reihenfolge der Zeilen exakt wie im Ausgabeformat.
-• "Besonderheiten" nur dann ausgeben, wenn mindestens ein Merkmal explizit genannt ist.
-• Verwende nur die vorgegebenen Feldnamen, keine Abwandlungen.
-• Gib ausschließlich die strukturierte Kurzbeschreibung aus. Keine zusätzlichen Texte vor oder nach der Ausgabe.
-• Wenn ein Feld nicht eindeutig ermittelbar ist, lasse die gesamte Zeile weg. """
+– Wohnfläche und Grundstück: m²
+– Preis: €
+• Keine Interpretationen, keine Schätzungen, keine Ableitungen.
+• Im Zweifel gilt: lieber weniger Felder ausgeben, niemals mehr.
+# Ziel
+Die Ausgabe wird automatisiert weiterverarbeitet (z. B. Airtable, Voiceflow, Such- und Filterlogiken).
+Jede Abweichung vom Format gilt als Fehler. """
 
     try:
         headers = {
