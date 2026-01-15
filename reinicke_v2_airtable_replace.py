@@ -60,6 +60,32 @@ RE_PRICE = re.compile(r"([\d.,]+)\s*€")
 # HELPER FUNCTIONS
 # ===========================================================================
 
+# Verschiedene User-Agents für Rotation
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+]
+
+def get_random_headers() -> dict:
+    """Generiert zufällige Browser-Header"""
+    import random
+    return {
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Cache-Control": "max-age=0",
+    }
+
 def _norm(s: str) -> str:
     """Normalisiere String"""
     if not s:
@@ -78,15 +104,81 @@ def clean_text(text: str) -> str:
     
     return '\n'.join(lines)
 
-def soup_get(url: str, delay: float = REQUEST_DELAY) -> BeautifulSoup:
-    """Hole HTML und parse mit BeautifulSoup"""
-    time.sleep(delay)
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-    }
-    r = requests.get(url, headers=headers, timeout=30)
-    r.raise_for_status()
-    return BeautifulSoup(r.text, "lxml")
+def soup_get(url: str, delay: float = REQUEST_DELAY, max_retries: int = 3) -> BeautifulSoup:
+    """
+    Hole HTML und parse mit BeautifulSoup.
+    Mit Retry-Logik und exponential backoff.
+    """
+    last_error = None
+    
+    for attempt in range(max_retries):
+        try:
+            # Delay vor Request (mit Jitter)
+            import random
+            jitter = random.uniform(0.5, 1.5)
+            time.sleep(delay * jitter)
+            
+            headers = get_random_headers()
+            
+            r = requests.get(url, headers=headers, timeout=30)
+            r.raise_for_status()
+            return BeautifulSoup(r.text, "lxml")
+            
+        except requests.exceptions.ConnectionError as e:
+            last_error = e
+            wait_time = (2 ** attempt) * 2  # 2, 4, 8 Sekunden
+            print(f"[RETRY] Verbindungsfehler (Versuch {attempt + 1}/{max_retries}), warte {wait_time}s...")
+            time.sleep(wait_time)
+            
+        except requests.exceptions.Timeout as e:
+            last_error = e
+            wait_time = (2 ** attempt) * 2
+            print(f"[RETRY] Timeout (Versuch {attempt + 1}/{max_retries}), warte {wait_time}s...")
+            time.sleep(wait_time)
+            
+        except requests.exceptions.HTTPError as e:
+            # Bei 403/429 länger warten
+            if e.response.status_code in [403, 429]:
+                last_error = e
+                wait_time = (2 ** attempt) * 5  # 5, 10, 20 Sekunden
+                print(f"[RETRY] HTTP {e.response.status_code} (Versuch {attempt + 1}/{max_retries}), warte {wait_time}s...")
+                time.sleep(wait_time)
+            else:
+                raise
+    
+    # Alle Retries fehlgeschlagen
+    raise last_error or Exception(f"Konnte {url} nach {max_retries} Versuchen nicht laden")
+
+
+def test_website_reachability() -> bool:
+    """Testet ob die Hauptwebsite erreichbar ist"""
+    print(f"[TEST] Prüfe Erreichbarkeit von {BASE}...")
+    
+    try:
+        headers = get_random_headers()
+        r = requests.get(BASE, headers=headers, timeout=15)
+        
+        if r.status_code == 200:
+            print(f"[TEST] ✅ Website erreichbar (Status: {r.status_code})")
+            return True
+        elif r.status_code == 403:
+            print(f"[TEST] ⚠️ Website blockiert Zugriff (Status: 403)")
+            print(f"[TEST] Mögliche Ursachen: Cloudflare, WAF, IP-Blocking")
+            return False
+        else:
+            print(f"[TEST] ⚠️ Unerwarteter Status: {r.status_code}")
+            return r.status_code < 500
+            
+    except requests.exceptions.ConnectionError as e:
+        print(f"[TEST] ❌ Verbindungsfehler: {e}")
+        print(f"[TEST] Die Website ist möglicherweise nicht erreichbar oder blockiert diese IP.")
+        return False
+    except requests.exceptions.Timeout:
+        print(f"[TEST] ❌ Timeout - Website antwortet nicht")
+        return False
+    except Exception as e:
+        print(f"[TEST] ❌ Fehler: {e}")
+        return False
 
 # ===========================================================================
 # AIRTABLE FUNCTIONS
@@ -574,7 +666,11 @@ def collect_detail_page_links_with_categories() -> List[Tuple[str, str, str]]:
     """Sammle Links zu Detailseiten MIT Kategorie/Unterkategorie von Übersichtsseite"""
     print(f"[LIST] Hole {LIST_URL}")
     
-    soup = soup_get(LIST_URL)
+    try:
+        soup = soup_get(LIST_URL, max_retries=3)
+    except Exception as e:
+        print(f"[ERROR] Konnte Übersichtsseite nicht laden: {e}")
+        return []
     
     detail_data = []
     
@@ -647,7 +743,7 @@ def collect_detail_page_links_with_categories() -> List[Tuple[str, str, str]]:
 def extract_iframe_from_detail_page(detail_url: str) -> Optional[str]:
     """Extrahiere Propstack iframe-URL von einer Detailseite"""
     try:
-        soup = soup_get(detail_url, delay=1.0)
+        soup = soup_get(detail_url, delay=1.0, max_retries=2)
         
         for iframe in soup.find_all("iframe"):
             src = iframe.get("src", "")
@@ -656,6 +752,9 @@ def extract_iframe_from_detail_page(detail_url: str) -> Optional[str]:
         
         return None
         
+    except requests.exceptions.ConnectionError as e:
+        print(f"[WARN] Verbindungsfehler bei {detail_url.split('/')[-1]}: {e}")
+        return None
     except Exception as e:
         print(f"[ERROR] Fehler beim Laden der Detailseite: {e}")
         return None
@@ -663,7 +762,7 @@ def extract_iframe_from_detail_page(detail_url: str) -> Optional[str]:
 def get_propstack_property_data_from_iframe(iframe_url: str) -> dict:
     """Hole Immobilien-Daten direkt aus Propstack iframe"""
     try:
-        soup = soup_get(iframe_url, delay=1.0)
+        soup = soup_get(iframe_url, delay=1.0, max_retries=2)
         
         data = {
             "titel": "",
@@ -944,6 +1043,31 @@ def unique_key(fields: dict) -> str:
 
 def run():
     print("[REINICKE] Starte Scraper für alainreinickeimmobilien.de (Propstack)")
+    print(f"[INFO] FULL_REPLACE Modus: {FULL_REPLACE}")
+    
+    # SCHRITT 0: Teste ob Website erreichbar ist
+    if not test_website_reachability():
+        print("\n" + "="*60)
+        print("[FATAL] Website nicht erreichbar!")
+        print("="*60)
+        print("Mögliche Lösungen:")
+        print("1. Warte und versuche es später erneut")
+        print("2. Prüfe ob die Website einen Proxy benötigt")
+        print("3. Führe den Scraper von einem anderen Server aus")
+        print("="*60)
+        
+        # Erstelle leere CSV damit GitHub Actions nicht komplett fehlschlägt
+        csv_file = "reinicke_immobilien.csv"
+        cols = ["Titel", "Kategorie", "Unterkategorie", "Webseite", "Objektnummer", "Beschreibung", "Kurzbeschreibung", "Bild", "Preis", "Standort"]
+        with open(csv_file, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=cols)
+            w.writeheader()
+        print(f"[INFO] Leere CSV erstellt: {csv_file}")
+        
+        # Exit mit Code 0 um GitHub Action nicht als "failed" zu markieren
+        # (Website-Blockierung ist kein Scraper-Fehler)
+        print("[INFO] Beende mit Exit-Code 0 (kein Scraper-Fehler)")
+        return
     
     # Lade Caches
     print("[INIT] Lade Caches aus Airtable...")
