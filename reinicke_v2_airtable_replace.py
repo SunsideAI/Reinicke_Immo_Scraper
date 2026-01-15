@@ -3,8 +3,7 @@
 Scraper für https://alainreinickeimmobilien.de/aktuelle-angebote/
 Extrahiert Immobilienangebote aus Propstack-iframes und synct mit Airtable
 
-Besonderheit: Website nutzt Propstack Landingpage-System mit iframes
-Shop-Token: DqFSVCcC7WoWndVggQ83eLtJ
+v2.0 - Mit verbesserter GPT-Kurzbeschreibung, Unterkategorie-Caching und Validierung
 """
 
 import os
@@ -33,7 +32,7 @@ BASE = "https://alainreinickeimmobilien.de"
 LIST_URL = f"{BASE}/aktuelle-angebote/"
 PROPSTACK_BASE = "https://alainreinicke.landingpage.immobilien"
 
-# Propstack Shop Token (fest für Reinicke)
+# Propstack Shop Token
 SHOP_TOKEN = "DqFSVCcC7WoWndVggQ83eLtJ"
 
 # Airtable
@@ -41,13 +40,11 @@ AIRTABLE_TOKEN = os.getenv("AIRTABLE_TOKEN", "")
 AIRTABLE_BASE = os.getenv("AIRTABLE_BASE", "")
 AIRTABLE_TABLE_ID = os.getenv("AIRTABLE_TABLE_ID", "")
 
-# OpenAI für Kurzbeschreibung
+# OpenAI
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
 # SYNC-MODUS
-# True  = Lösche ALLES in Airtable und ersetze mit neuen Daten
-# False = Update/Create/Delete nur geänderte Records (intelligent)
-FULL_REPLACE = os.getenv("FULL_REPLACE", "true").lower() == "true"
+FULL_REPLACE = os.getenv("FULL_REPLACE", "false").lower() == "true"
 
 # Rate Limiting
 REQUEST_DELAY = 1.5
@@ -70,6 +67,17 @@ def _norm(s: str) -> str:
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
+def clean_text(text: str) -> str:
+    """Bereinigt Text: Entfernt mehrfache Leerzeilen und unnötige Whitespaces."""
+    if not text:
+        return ""
+    
+    text = re.sub(r'\n\s*\n+', '\n', text)
+    lines = [line.strip() for line in text.split('\n')]
+    lines = [line for line in lines if line]
+    
+    return '\n'.join(lines)
+
 def soup_get(url: str, delay: float = REQUEST_DELAY) -> BeautifulSoup:
     """Hole HTML und parse mit BeautifulSoup"""
     time.sleep(delay)
@@ -79,759 +87,6 @@ def soup_get(url: str, delay: float = REQUEST_DELAY) -> BeautifulSoup:
     r = requests.get(url, headers=headers, timeout=30)
     r.raise_for_status()
     return BeautifulSoup(r.text, "lxml")
-
-# ===========================================================================
-# GPT KURZBESCHREIBUNG MIT CACHING
-# ===========================================================================
-
-# Cache für existierende Kurzbeschreibungen (wird beim Start gefüllt)
-KURZBESCHREIBUNG_CACHE = {}  # {objektnummer: kurzbeschreibung}
-
-def load_kurzbeschreibung_cache():
-    """Lädt existierende Kurzbeschreibungen aus Airtable in den Cache"""
-    global KURZBESCHREIBUNG_CACHE
-    
-    if not (AIRTABLE_TOKEN and AIRTABLE_BASE and airtable_table_segment()):
-        print("[CACHE] Airtable nicht konfiguriert - Cache leer")
-        return
-    
-    # Im FULL_REPLACE Modus macht Caching keinen Sinn
-    if FULL_REPLACE:
-        print("[CACHE] FULL_REPLACE Modus - Cache übersprungen")
-        return
-    
-    try:
-        all_ids, all_fields = airtable_list_all()
-        for fields in all_fields:
-            obj_nr = fields.get("Objektnummer", "").strip()
-            kurzbeschreibung = fields.get("Kurzbeschreibung", "").strip()
-            if obj_nr and kurzbeschreibung:
-                KURZBESCHREIBUNG_CACHE[obj_nr] = kurzbeschreibung
-        
-        print(f"[CACHE] {len(KURZBESCHREIBUNG_CACHE)} Kurzbeschreibungen aus Airtable geladen")
-    except Exception as e:
-        print(f"[CACHE] Fehler beim Laden: {e}")
-
-def get_cached_kurzbeschreibung(objektnummer: str) -> str:
-    """Holt Kurzbeschreibung aus Cache wenn vorhanden"""
-    return KURZBESCHREIBUNG_CACHE.get(objektnummer, "")
-
-# Einheitliche Feldstruktur für Kurzbeschreibung
-KURZBESCHREIBUNG_FIELDS = [
-    "Objekttyp",
-    "Zimmer", 
-    "Schlafzimmer",
-    "Wohnfläche",
-    "Grundstück",
-    "Baujahr",
-    "Kategorie",
-    "Preis",
-    "Standort",
-    "Energieeffizienz",
-    "Besonderheiten"
-]
-
-def normalize_kurzbeschreibung(gpt_output: str, scraped_data: dict) -> str:
-    """
-    Normalisiert die GPT-Ausgabe und füllt fehlende Felder mit Scrape-Daten oder '-'.
-    Stellt einheitliche Struktur sicher.
-    """
-    # Parse GPT Output in Dictionary
-    parsed = {}
-    for line in gpt_output.strip().split("\n"):
-        if ":" in line:
-            key, value = line.split(":", 1)
-            key = key.strip()
-            value = value.strip()
-            if value and value != "-":
-                parsed[key] = value
-    
-    # Mapping von Scrape-Feldern zu Kurzbeschreibung-Feldern
-    scrape_mapping = {
-        "Zimmer": "zimmer",
-        "Wohnfläche": "wohnflaeche", 
-        "Grundstück": "grundstueck",
-        "Baujahr": "baujahr",
-        "Kategorie": "kategorie",
-        "Preis": "preis",
-        "Standort": "standort",
-    }
-    
-    # Fülle fehlende Felder aus Scrape-Daten
-    for field, scrape_key in scrape_mapping.items():
-        if field not in parsed or not parsed[field] or parsed[field] == "-":
-            scrape_value = scraped_data.get(scrape_key, "")
-            if scrape_value:
-                # Formatiere Preis
-                if field == "Preis" and scrape_value:
-                    try:
-                        preis_num = float(str(scrape_value).replace(".", "").replace(",", ".").replace("€", "").strip())
-                        parsed[field] = f"{int(preis_num):,} €".replace(",", ".")
-                    except:
-                        parsed[field] = str(scrape_value)
-                # Formatiere Wohnfläche
-                elif field == "Wohnfläche" and scrape_value:
-                    if "m²" not in str(scrape_value):
-                        parsed[field] = f"{scrape_value} m²"
-                    else:
-                        parsed[field] = str(scrape_value)
-                # Formatiere Grundstück
-                elif field == "Grundstück" and scrape_value:
-                    if "m²" not in str(scrape_value):
-                        parsed[field] = f"{scrape_value} m²"
-                    else:
-                        parsed[field] = str(scrape_value)
-                else:
-                    parsed[field] = str(scrape_value)
-    
-    # Baue einheitliche Ausgabe mit allen Feldern
-    output_lines = []
-    for field in KURZBESCHREIBUNG_FIELDS:
-        value = parsed.get(field, "-")
-        if not value or value.strip() == "":
-            value = "-"
-        output_lines.append(f"{field}: {value}")
-    
-    return "\n".join(output_lines)
-
-def generate_kurzbeschreibung(beschreibung: str, titel: str, kategorie: str, preis: str, ort: str,
-                               zimmer: str = "", wohnflaeche: str = "", grundstueck: str = "", baujahr: str = "",
-                               objektnummer: str = "") -> str:
-    """
-    Generiert eine strukturierte Kurzbeschreibung mit GPT für die KI-Suche.
-    Format ist optimiert für Regex/KI-Matching im Chatbot.
-    Fehlende Felder werden aus Scrape-Daten ergänzt oder mit '-' gefüllt.
-    
-    OPTIMIERUNG: Wenn bereits eine Kurzbeschreibung in Airtable existiert, wird diese verwendet.
-    """
-    
-    # CACHE CHECK: Wenn bereits vorhanden, nicht neu generieren!
-    if objektnummer:
-        cached = get_cached_kurzbeschreibung(objektnummer)
-        if cached:
-            print(f"[CACHE] Kurzbeschreibung aus Cache verwendet für {objektnummer[:30]}...")
-            return cached
-    
-    # Scrape-Daten für Fallback sammeln
-    scraped_data = {
-        "kategorie": kategorie,
-        "preis": preis,
-        "standort": ort,
-        "zimmer": zimmer,
-        "wohnflaeche": wohnflaeche,
-        "grundstueck": grundstueck,
-        "baujahr": baujahr,
-    }
-    
-    if not OPENAI_API_KEY:
-        print("[WARN] OPENAI_API_KEY nicht gesetzt - erstelle Kurzbeschreibung aus Scrape-Daten")
-        # Fallback: Erstelle Kurzbeschreibung nur aus Scrape-Daten
-        return normalize_kurzbeschreibung("", scraped_data)
-    
-    # Baue zusätzliche Daten-Sektion für GPT
-    zusatz_daten = []
-    if zimmer:
-        zusatz_daten.append(f"Zimmer: {zimmer}")
-    if wohnflaeche:
-        zusatz_daten.append(f"Wohnfläche: {wohnflaeche}")
-    if grundstueck:
-        zusatz_daten.append(f"Grundstück: {grundstueck}")
-    if baujahr:
-        zusatz_daten.append(f"Baujahr: {baujahr}")
-    
-    zusatz_text = "\n".join(zusatz_daten) if zusatz_daten else "Keine zusätzlichen Daten"
-    
-    prompt = f"""# Rolle
-Du bist ein präziser Immobilien-Datenanalyst und Parser.
-Deine Aufgabe ist es, aus unstrukturierten Immobilienanzeigen ausschließlich objektive, explizit genannte Fakten zu extrahieren und streng strukturiert auszugeben.
-Du arbeitest regelbasiert, deterministisch und formatgenau. Kreative Ergänzungen sind untersagt.
-# Aufgabe
-Analysiere die bereitgestellte Immobilienanzeige vollständig.
-Extrahiere nur eindeutig genannte, objektive Fakten.
-Gib die strukturierte Kurzbeschreibung exakt im vorgegebenen Zeilenformat aus.
-Lasse jedes Feld vollständig weg, zu dem keine eindeutige Angabe vorliegt.
-# Eingabedaten
-TITEL: {titel}
-KATEGORIE: {kategorie}
-PREIS: {preis}
-STANDORT: {ort}
-BESCHREIBUNG:
-{beschreibung[:3000]}
-# Erlaubte Felder (Whitelist – verbindlich)
-Es dürfen ausschließlich die folgenden Felder verwendet werden.
-Jedes andere Feld ist strikt verboten.
-Objekttyp
-Baujahr
-Wohnfläche
-Grundstück
-Zimmer
-Preis
-Standort
-Energieeffizienz
-Besonderheiten
-# Ausgabeformat (verbindlich)
-Die Ausgabe muss exakt diesem Muster folgen.
-Jede Eigenschaft steht in einer eigenen Zeile.
-Keine Leerzeilen, keine zusätzlichen Texte, keine Markdown-Formatierung.
-Objekttyp: [Einfamilienhaus | Mehrfamilienhaus | Eigentumswohnung | Baugrundstück | Reihenhaus | Doppelhaushälfte | Sonstiges]
-Baujahr: [Jahr]
-Wohnfläche: [Zahl in m²]
-Grundstück: [Zahl in m²]
-Zimmer: [Anzahl]
-Preis: [Zahl in €]
-Standort: [Ort oder PLZ Ort]
-Energieeffizienz: [Klasse]
-Besonderheiten: [kommaseparierte Liste]
-# Strikte Regeln (bindend)
-• Es ist strengstens untersagt, eigene Felder zu erfinden.
-• Felder wie „Schlafzimmer“, „Kategorie“, „Etage“, „Ausstattung“, „Kauf/Miete“ oder ähnliche sind ausnahmslos verboten.
-• Es dürfen keine Platzhalter verwendet werden (z. B. „-“, „—“, „k. A.“, „unbekannt“).
-• Wenn ein Feld nicht eindeutig ermittelbar ist, darf die gesamte Zeile nicht ausgegeben werden.
-• Die Reihenfolge der Zeilen muss exakt der Vorgabe entsprechen.
-• Es darf niemals mehr als ein Feld pro Zeile stehen.
-• Verwende ausschließlich arabische Ziffern.
-• Einheiten exakt wie folgt anhängen:
-– Wohnfläche und Grundstück: m²
-– Preis: €
-• Keine Interpretationen, keine Schätzungen, keine Ableitungen.
-• Im Zweifel gilt: lieber weniger Felder ausgeben, niemals mehr.
-# Ziel
-Die Ausgabe wird automatisiert weiterverarbeitet (z. B. Airtable, Voiceflow, Such- und Filterlogiken).
-Jede Abweichung vom Format gilt als Fehler. """
-
-    try:
-        headers = {
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-            "Content-Type": "application/json"
-        }
-        
-        payload = {
-            "model": "gpt-4o-mini",
-            "messages": [
-                {"role": "system", "content": "Du bist ein Experte für Immobilienanalyse. Erstelle präzise, strukturierte Kurzbeschreibungen. Halte dich EXAKT an das vorgegebene Format."},
-                {"role": "user", "content": prompt}
-            ],
-            "max_tokens": 500,
-            "temperature": 0.1
-        }
-        
-        response = requests.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers=headers,
-            json=payload,
-            timeout=30
-        )
-        response.raise_for_status()
-        
-        result = response.json()
-        gpt_output = result["choices"][0]["message"]["content"].strip()
-        
-        # Normalisiere und fülle fehlende Felder
-        kurzbeschreibung = normalize_kurzbeschreibung(gpt_output, scraped_data)
-        
-        print(f"[GPT] Kurzbeschreibung generiert und normalisiert ({len(kurzbeschreibung)} Zeichen)")
-        return kurzbeschreibung
-        
-    except Exception as e:
-        print(f"[ERROR] GPT Kurzbeschreibung fehlgeschlagen: {e}")
-        # Fallback: Erstelle aus Scrape-Daten
-        return normalize_kurzbeschreibung("", scraped_data)
-
-# ===========================================================================
-# PROPSTACK IFRAME FUNCTIONS
-# ===========================================================================
-
-def collect_detail_page_links_with_categories() -> List[Tuple[str, str, str]]:
-    """Sammle Links zu Detailseiten MIT Kategorie/Unterkategorie von Übersichtsseite"""
-    print(f"[LIST] Hole {LIST_URL}")
-    
-    # Verwende soup_get für konsistente Netzwerk-Behandlung
-    soup = soup_get(LIST_URL)
-    
-    detail_data = []  # Liste von (url, kategorie, unterkategorie)
-    
-    # Mapping: Überschrift → (Kategorie, Unterkategorie)
-    section_mapping = {
-        "einfamilienhaus": ("Kaufen", "Haus"),
-        "einfamilienhäuser": ("Kaufen", "Haus"),
-        "doppelhaushälfte": ("Kaufen", "Haus"),
-        "doppelhaushälften": ("Kaufen", "Haus"),
-        "zweifamilienhaus": ("Kaufen", "Haus"),
-        "zweifamilienhäuser": ("Kaufen", "Haus"),
-        "mehrfamilienhaus": ("Kaufen", "Haus"),
-        "mehrfamilienhäuser": ("Kaufen", "Haus"),
-        "eigentumswohnung": ("Kaufen", "Wohnung"),
-        "eigentumswohnungen": ("Kaufen", "Wohnung"),
-        "gewerbeimmobilie": (None, "Gewerbe"),  # Kategorie aus Preis
-        "gewerbeimmobilien": (None, "Gewerbe"),
-        "mietobjekt": ("Mieten", None),  # Unterkategorie aus Titel
-        "mietobjekte": ("Mieten", None),
-        "grundstück": ("Kaufen", "Grundstück"),
-        "grundstücke": ("Kaufen", "Grundstück"),
-        "neubau": ("Kaufen", "Haus"),
-    }
-    
-    # Sammle alle Immobilien-Links
-    # NEUE LOGIK: Nehme ALLE internen Links AUSSER Navigations-Seiten
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        
-        # Nur interne Links
-        if not (href.startswith("/") or "alainreinickeimmobilien.de" in href):
-            continue
-        
-        # Mache URL absolut
-        full_url = urljoin(BASE, href)
-        full_url = full_url.split("#")[0].split("?")[0]
-        
-        # Dedupliziere
-        if any(d[0] == full_url for d in detail_data) or full_url == LIST_URL:
-            continue
-        
-        # BLACKLIST: Überspringe Navigations-Seiten
-        path_lower = full_url.lower()
-        if any(skip in path_lower for skip in [
-            "/startseite",
-            "/warum-wir", 
-            "/immobilien-ankauf",
-            "/immobilienbewertung",
-            "/aktuelle-angebote",
-            "/kontakt",
-            "/impressum",
-            "/datenschutz",
-            "/agb",
-            "/cookie",
-            BASE + "/#",
-            BASE + "/$"
-        ]):
-            continue
-        
-        # Ignoriere root URL
-        if full_url == BASE or full_url == BASE + "/":
-            continue
-        
-        # Finde vorherige Überschrift (h2, h3, h4)
-        prev_header_text = ""
-        for sibling in a.find_all_previous(["h2", "h3", "h4"]):
-            prev_header_text = sibling.get_text(strip=True).lower()
-            break
-        
-        # Bestimme Kategorie/Unterkategorie aus Überschrift
-        kategorie = "Kaufen"  # Default
-        unterkategorie = "Haus"  # Default
-        
-        if prev_header_text:
-            for key, (kat, unterkat) in section_mapping.items():
-                if key in prev_header_text:
-                    if kat:
-                        kategorie = kat
-                    if unterkat:
-                        unterkategorie = unterkat
-                    break
-        
-        detail_data.append((full_url, kategorie, unterkategorie))
-        slug = full_url.split("/")[-1]
-        print(f"[DEBUG] {slug[:40]:<40} → {kategorie:8} / {unterkategorie}")
-    
-    print(f"\n[LIST] Gefunden: {len(detail_data)} Detailseiten")
-    return detail_data
-
-def extract_iframe_from_detail_page(detail_url: str) -> Optional[str]:
-    """Extrahiere Propstack iframe-URL von einer Detailseite"""
-    print(f"[DETAIL] Lade {detail_url.split('/')[-1]}")
-    
-    try:
-        soup = soup_get(detail_url, delay=1.0)
-        
-        # Suche nach Propstack iframe
-        for iframe in soup.find_all("iframe"):
-            src = iframe.get("src", "")
-            if "landingpage.immobilien" in src and "/public/exposee/" in src:
-                print(f"[DEBUG] iframe gefunden!")
-                return src
-        
-        print(f"[WARN] Kein Propstack iframe gefunden")
-        return None
-        
-    except Exception as e:
-        print(f"[ERROR] Fehler beim Laden der Detailseite: {e}")
-        return None
-
-def get_propstack_property_data_from_iframe(iframe_url: str) -> dict:
-    """Hole Immobilien-Daten direkt aus Propstack iframe"""
-    print(f"[PROPSTACK] Lade iframe...")
-    
-    try:
-        soup = soup_get(iframe_url, delay=1.0)
-        
-        # Extrahiere Daten aus der Propstack-Seite
-        data = {
-            "titel": "",
-            "beschreibung": "",
-            "preis": "",
-            "ort": "",
-            "kategorie": "Kaufen",  # Default, wird von Übersichtsseite überschrieben
-            "unterkategorie": "Haus",  # Default, wird von Übersichtsseite überschrieben
-            "bild_url": "",
-            "zimmer": "",
-            "wohnflaeche": "",
-            "grundstueck": "",
-            "baujahr": "",
-        }
-        
-        # Titel - suche h1, h2 oder title
-        for tag in ["h1", "h2", "title"]:
-            elem = soup.find(tag)
-            if elem:
-                text = _norm(elem.get_text(strip=True))
-                if len(text) > 5:
-                    data["titel"] = text
-                    break
-        
-        # Unterkategorie aus Titel oder Text extrahieren
-        text_content = soup.get_text().lower()
-        text_content_full = soup.get_text()  # FULL text für Preis und PLZ/Ort
-        titel_lower = data["titel"].lower()
-        
-        # Einfache Kategorien wie auf der Website
-        if any(kw in titel_lower or kw in text_content for kw in ["grundstück", "baugrundstück", "bauland"]):
-            data["unterkategorie"] = "Grundstück"
-        elif any(kw in titel_lower or kw in text_content for kw in ["gewerbe", "halle", "büro", "laden", "praxis"]):
-            data["unterkategorie"] = "Gewerbe"
-        elif any(kw in titel_lower or kw in text_content for kw in ["wohnung", "etw", "eigentumswohnung"]):
-            data["unterkategorie"] = "Wohnung"
-        elif any(kw in titel_lower or kw in text_content for kw in [
-            "haus", "einfamilienhaus", "efh", "zweifamilienhaus", "2fh", "mehrfamilienhaus", "mfh",
-            "doppelhaushälfte", "dhh", "reihenhaus", "villa", "bungalow"
-        ]):
-            data["unterkategorie"] = "Haus"
-        else:
-            # Fallback: Versuche aus Titel zu erraten
-            data["unterkategorie"] = "Haus"  # Default
-        
-        # Preis - suche nach Preis-Pattern
-        price_matches = RE_PRICE.findall(text_content)
-        if price_matches:
-            # Nehme den höchsten Preis (wahrscheinlich Kaufpreis)
-            prices = []
-            for p in price_matches:
-                try:
-                    clean = p.replace(".", "").replace(",", ".")
-                    val = float(clean)
-                    if val > 100:  # Filter kleine Zahlen (Zimmeranzahl etc.)
-                        prices.append((val, p + " €"))
-                except:
-                    pass
-            if prices:
-                # Sortiere und nimm höchsten
-                prices.sort(reverse=True)
-                data["preis"] = prices[0][1]
-        
-        # SPEZIALFALL: Mietobjekte - Warmmiete/Kaltmiete explizit suchen
-        miete_pattern = re.compile(r'(?:Warmmiete|Kaltmiete|Miete)\s*[:.]?\s*([\d.,]+)\s*€', re.IGNORECASE)
-        miete_matches = miete_pattern.findall(text_content_full)
-        
-        if miete_matches:
-            # Warmmiete bevorzugen, dann Kaltmiete
-            for miete_str in miete_matches:
-                try:
-                    clean = miete_str.replace(".", "").replace(",", ".")
-                    val = float(clean)
-                    if val > 100:
-                        # Formatiere Preis
-                        data["preis"] = f"{miete_str.replace('.', '').replace(',', '.')} €"
-                        # Setze Kategorie auf Mieten wenn Miete gefunden
-                        data["kategorie"] = "Mieten"
-                        print(f"[DEBUG] Warmmiete/Kaltmiete gefunden: {data['preis']}")
-                        break
-                except:
-                    pass
-        
-        # PLZ/Ort - mit mehreren Ansätzen
-        # Ansatz 1: Standard PLZ-Pattern
-        match = RE_PLZ_ORT.search(text_content_full)
-        if match:
-            data["ort"] = f"{match.group(1)} {match.group(2).strip()}"
-        
-        # Ansatz 2: Suche in Meta-Tags oder speziellen Feldern
-        if not data["ort"]:
-            for meta in soup.find_all("meta"):
-                content = meta.get("content", "")
-                match = RE_PLZ_ORT.search(content)
-                if match:
-                    data["ort"] = f"{match.group(1)} {match.group(2).strip()}"
-                    break
-        
-        # Ansatz 3: Suche nach "in STADT" Pattern
-        if not data["ort"]:
-            match = re.search(r'\bin\s+(\d{5})\s+([A-ZÄÖÜ][a-zäöüß\-]+)', text_content_full)
-            if match:
-                data["ort"] = f"{match.group(1)} {match.group(2)}"
-        
-        # Zusätzliche Daten für Kurzbeschreibung extrahieren
-        # Zimmer
-        zimmer_match = re.search(r'(\d+)\s*Zimmer', text_content_full, re.IGNORECASE)
-        if zimmer_match:
-            data["zimmer"] = zimmer_match.group(1)
-        
-        # Wohnfläche
-        wohnflaeche_match = re.search(r'(?:ca\.\s*)?(\d+(?:[.,]\d+)?)\s*m²\s*(?:Wohnfläche|Wohnfl)', text_content_full, re.IGNORECASE)
-        if wohnflaeche_match:
-            data["wohnflaeche"] = wohnflaeche_match.group(1).replace(",", ".")
-        
-        # Grundstück
-        grundstueck_match = re.search(r'(?:ca\.\s*)?(\d+(?:[.,]\d+)?)\s*m²\s*(?:Grundstück|Grundst)', text_content_full, re.IGNORECASE)
-        if grundstueck_match:
-            data["grundstueck"] = grundstueck_match.group(1).replace(",", ".")
-        
-        # Baujahr
-        baujahr_match = re.search(r'Baujahr[:\s]+(\d{4})', text_content_full, re.IGNORECASE)
-        if baujahr_match:
-            data["baujahr"] = baujahr_match.group(1)
-        
-        # Beschreibung - sammle Textabschnitte
-        paragraphs = []
-        for p in soup.find_all(["p", "div"]):
-            text = _norm(p.get_text())
-            if 50 < len(text) < 500:
-                # Filter unwichtige Texte
-                if not any(skip in text.lower() for skip in ["cookie", "datenschutz", "impressum", "javascript"]):
-                    paragraphs.append(text)
-                    if len(paragraphs) >= 5:
-                        break
-        
-        if paragraphs:
-            data["beschreibung"] = "\n\n".join(paragraphs)[:5000]
-        
-        # BILD - VERBESSERTE EXTRAKTION
-        # Strategie: Mehrere Ansätze ausprobieren bis ein Bild gefunden wird
-        
-        # Ansatz 1: Suche nach img mit bestimmten Klassen
-        for class_name in ["property-image", "object-image", "main-image", "gallery-image", "slider-image"]:
-            img = soup.find("img", class_=lambda x: x and class_name in str(x).lower())
-            if img:
-                src = img.get("src", "")
-                if src and not any(skip in src.lower() for skip in ["logo", "icon", "favicon", "placeholder"]):
-                    data["bild_url"] = src if src.startswith("http") else urljoin(iframe_url, src)
-                    print(f"[DEBUG] Bild gefunden (Klasse: {class_name})")
-                    break
-        
-        # Ansatz 2: Suche in srcset (oft höhere Auflösungen)
-        if not data["bild_url"]:
-            for img in soup.find_all("img"):
-                srcset = img.get("srcset", "")
-                if srcset:
-                    # Parse srcset und nimm größtes Bild
-                    parts = [s.strip().split()[0] for s in srcset.split(",") if s.strip()]
-                    if parts:
-                        src = parts[-1]  # Größte Auflösung
-                        if not any(skip in src.lower() for skip in ["logo", "icon", "favicon"]):
-                            data["bild_url"] = src if src.startswith("http") else urljoin(iframe_url, src)
-                            print(f"[DEBUG] Bild gefunden (srcset)")
-                            break
-        
-        # Ansatz 3: Erstes großes Bild (width > 200 oder ohne width)
-        if not data["bild_url"]:
-            for img in soup.find_all("img"):
-                src = img.get("src", "")
-                alt = img.get("alt", "").lower()
-                width = img.get("width", "")
-                
-                # Ignoriere Logos, Icons
-                if any(skip in src.lower() for skip in ["logo", "icon", "favicon"]):
-                    continue
-                if any(skip in alt for skip in ["logo", "icon"]):
-                    continue
-                
-                # Prüfe Größe
-                is_large = True
-                if width:
-                    try:
-                        if int(width) < 200:
-                            is_large = False
-                    except:
-                        pass
-                
-                if src and is_large:
-                    data["bild_url"] = src if src.startswith("http") else urljoin(iframe_url, src)
-                    print(f"[DEBUG] Bild gefunden (erstes großes img)")
-                    break
-        
-        # Ansatz 4: Suche in background-image CSS
-        if not data["bild_url"]:
-            for elem in soup.find_all(style=True):
-                style = elem.get("style", "")
-                if "background-image" in style:
-                    match = re.search(r'url\(["\']?([^"\']+)["\']?\)', style)
-                    if match:
-                        url = match.group(1)
-                        if not any(skip in url.lower() for skip in ["logo", "icon"]):
-                            data["bild_url"] = url if url.startswith("http") else urljoin(iframe_url, url)
-                            print(f"[DEBUG] Bild gefunden (background-image)")
-                            break
-        
-        # Ansatz 5: Einfach das erste img-Tag (Fallback)
-        if not data["bild_url"]:
-            img = soup.find("img")
-            if img:
-                src = img.get("src", "")
-                if src:
-                    data["bild_url"] = src if src.startswith("http") else urljoin(iframe_url, src)
-                    print(f"[DEBUG] Bild gefunden (Fallback: erstes img)")
-        
-        if not data["bild_url"]:
-            print(f"[WARN] ⚠️  KEIN Bild gefunden!")
-        
-        return data
-        
-    except Exception as e:
-        print(f"[ERROR] Failed to load iframe: {e}")
-        return None
-
-# ===========================================================================
-# SCRAPING FUNCTIONS
-# ===========================================================================
-
-def collect_all_properties() -> List[dict]:
-    """Sammle alle Immobilien von der Website"""
-    
-    # Schritt 1: Sammle Links zu Detailseiten MIT Kategorie-Info
-    detail_data = collect_detail_page_links_with_categories()
-    
-    if not detail_data:
-        print("[WARN] Keine Detailseiten gefunden!")
-        print("[INFO] Prüfe ob die Website-Struktur sich geändert hat")
-        return []
-    
-    # Schritt 2: Für jede Detailseite, extrahiere iframe und hole Daten
-    all_properties = []
-    
-    for i, (detail_url, overview_kategorie, overview_unterkategorie) in enumerate(detail_data, 1):
-        print(f"\n[SCRAPE] {i}/{len(detail_data)}")
-        
-        try:
-            # Finde iframe auf der Detailseite
-            iframe_url = extract_iframe_from_detail_page(detail_url)
-            
-            if not iframe_url:
-                print(f"  ⚠️  Überspringe - kein iframe gefunden")
-                continue
-            
-            # Lade Daten aus dem iframe
-            prop_data = get_propstack_property_data_from_iframe(iframe_url)
-            
-            if prop_data:
-                # Überschreibe Kategorie/Unterkategorie mit Daten von Übersichtsseite
-                # AUSSER wenn Warmmiete/Kaltmiete im iframe gefunden wurde (dann ist es sicher Mieten)
-                if overview_kategorie and prop_data["kategorie"] != "Mieten":
-                    prop_data["kategorie"] = overview_kategorie
-                elif prop_data["kategorie"] == "Mieten":
-                    # Warmmiete wurde gefunden - behalte "Mieten"
-                    pass
-                    
-                if overview_unterkategorie:
-                    prop_data["unterkategorie"] = overview_unterkategorie
-                
-                # Spezialfall: Gewerbe - Kategorie aus Preis ableiten
-                if prop_data["unterkategorie"] == "Gewerbe" and not overview_kategorie:
-                    # Extrahiere Preis-Wert
-                    preis_text = prop_data.get("preis", "")
-                    try:
-                        clean = preis_text.replace("€", "").replace(".", "").replace(",", ".").strip()
-                        preis_val = float(clean)
-                        if preis_val < 30000:
-                            prop_data["kategorie"] = "Mieten"
-                        else:
-                            prop_data["kategorie"] = "Kaufen"
-                    except:
-                        prop_data["kategorie"] = "Kaufen"  # Default
-                
-                # Spezialfall: Mietobjekte - Unterkategorie aus Titel ableiten
-                if prop_data["kategorie"] == "Mieten" and not overview_unterkategorie:
-                    titel_lower = prop_data.get("titel", "").lower()
-                    if "wohnung" in titel_lower:
-                        prop_data["unterkategorie"] = "Wohnung"
-                    elif "haus" in titel_lower:
-                        prop_data["unterkategorie"] = "Haus"
-                    elif "gewerbe" in titel_lower or "büro" in titel_lower:
-                        prop_data["unterkategorie"] = "Gewerbe"
-                    else:
-                        prop_data["unterkategorie"] = "Wohnung"  # Default für Mietobjekte
-                
-                # Extrahiere Objektnummer aus iframe-URL
-                match = re.search(r"(eyJ[A-Za-z0-9+/=]+)", iframe_url)
-                if match:
-                    token_b64 = match.group(1)
-                    try:
-                        padding = len(token_b64) % 4
-                        if padding:
-                            token_b64 += "=" * (4 - padding)
-                        decoded = base64.b64decode(token_b64).decode('utf-8')
-                        token_data = json.loads(decoded)
-                        prop_data["objektnummer"] = token_data.get("property_token", "")
-                    except:
-                        prop_data["objektnummer"] = detail_url.split("/")[-1]
-                else:
-                    prop_data["objektnummer"] = detail_url.split("/")[-1]
-                
-                # URL der Detailseite
-                prop_data["url"] = detail_url
-                
-                all_properties.append(prop_data)
-                
-                # Zeige Vorschau
-                bild_status = "✅" if prop_data.get("bild_url") else "❌"
-                print(f"  → {prop_data.get('kategorie', 'N/A'):8} | {prop_data.get('unterkategorie', 'N/A'):20} | {prop_data.get('titel', 'Unbekannt')[:40]} | Bild: {bild_status}")
-            else:
-                print(f"  ⚠️  Keine Daten extrahiert")
-                
-        except Exception as e:
-            print(f"  ❌ Fehler: {e}")
-            continue
-    
-    return all_properties
-
-def make_record(prop: dict) -> dict:
-    """Erstelle Airtable-Record"""
-    # Konvertiere Preis
-    preis_value = None
-    if prop.get("preis"):
-        try:
-            clean = prop["preis"].replace("€", "").replace(".", "").replace(",", ".").strip()
-            preis_value = float(clean)
-        except:
-            pass
-    
-    # Kurzbeschreibung via GPT generieren (mit Cache-Check)
-    kurzbeschreibung = generate_kurzbeschreibung(
-        beschreibung=prop.get("beschreibung", ""),
-        titel=prop.get("titel", ""),
-        kategorie=prop.get("kategorie", "Kaufen"),
-        preis=prop.get("preis", ""),
-        ort=prop.get("ort", ""),
-        zimmer=prop.get("zimmer", ""),
-        wohnflaeche=prop.get("wohnflaeche", ""),
-        grundstueck=prop.get("grundstueck", ""),
-        baujahr=prop.get("baujahr", ""),
-        objektnummer=prop.get("objektnummer", "")
-    )
-    
-    record = {
-        "Titel": prop.get("titel", "Unbekannt"),
-        "Kategorie": prop.get("kategorie", "Kaufen"),
-        "Unterkategorie": prop.get("unterkategorie", "Sonstiges"),
-        "Webseite": prop.get("url", ""),
-        "Objektnummer": prop.get("objektnummer", ""),
-        "Beschreibung": prop.get("beschreibung", ""),
-        "Kurzbeschreibung": kurzbeschreibung,
-        "Bild": prop.get("bild_url", ""),
-        "Standort": prop.get("ort", ""),
-    }
-    
-    if preis_value is not None:
-        record["Preis"] = preis_value
-    
-    return record
 
 # ===========================================================================
 # AIRTABLE FUNCTIONS
@@ -874,6 +129,10 @@ def airtable_list_all() -> tuple:
     fields = [rec.get("fields", {}) for rec in all_records]
     return ids, fields
 
+def airtable_existing_fields() -> set:
+    """Hole existierende Felder"""
+    return set()  # Keine Filterung
+
 def airtable_batch_create(records: List[dict]):
     url = f"https://api.airtable.com/v0/{airtable_table_segment()}"
     headers = airtable_headers()
@@ -907,6 +166,769 @@ def airtable_batch_delete(record_ids: List[str]):
         r.raise_for_status()
         time.sleep(0.2)
 
+def sanitize_record_for_airtable(record: dict, allowed_fields: set) -> dict:
+    ALWAYS_ALLOWED = {"Kurzbeschreibung"}
+    
+    if not allowed_fields:
+        return record
+    
+    all_allowed = allowed_fields | ALWAYS_ALLOWED
+    return {k: v for k, v in record.items() if k in all_allowed}
+
+# ===========================================================================
+# VALIDIERUNG - Leere Records filtern
+# ===========================================================================
+
+def is_valid_record(record: dict) -> bool:
+    """Prüft ob ein Record gültig ist (nicht leer)."""
+    titel = (record.get("Titel") or "").strip()
+    webseite = (record.get("Webseite") or "").strip()
+    
+    if not titel or not webseite:
+        return False
+    
+    filled_fields = 0
+    for key, value in record.items():
+        if value is not None:
+            if isinstance(value, str) and value.strip():
+                filled_fields += 1
+            elif isinstance(value, (int, float)) and value > 0:
+                filled_fields += 1
+    
+    return filled_fields >= 3
+
+
+def filter_valid_records(records: list) -> list:
+    """Filtert ungültige/leere Records heraus"""
+    valid = []
+    invalid_count = 0
+    
+    for record in records:
+        if is_valid_record(record):
+            valid.append(record)
+        else:
+            invalid_count += 1
+            print(f"[FILTER] Ungültiger Record: {record.get('Titel', 'KEIN TITEL')[:50]}")
+    
+    if invalid_count > 0:
+        print(f"[FILTER] {invalid_count} ungültige Records herausgefiltert")
+    
+    return valid
+
+
+def cleanup_empty_airtable_records():
+    """Löscht leere/ungültige Records aus Airtable."""
+    if not (AIRTABLE_TOKEN and AIRTABLE_BASE and airtable_table_segment()):
+        return
+    
+    print("[CLEANUP] Prüfe Airtable auf leere Records...")
+    
+    try:
+        all_ids, all_fields = airtable_list_all()
+        
+        to_delete = []
+        for rec_id, fields in zip(all_ids, all_fields):
+            if not is_valid_record(fields):
+                to_delete.append(rec_id)
+                print(f"[CLEANUP] Leerer Record: {fields.get('Titel', 'KEIN TITEL')[:40]}")
+        
+        if to_delete:
+            print(f"[CLEANUP] Lösche {len(to_delete)} leere Records...")
+            airtable_batch_delete(to_delete)
+            print(f"[CLEANUP] ✅ {len(to_delete)} leere Records gelöscht")
+        else:
+            print("[CLEANUP] ✅ Keine leeren Records gefunden")
+            
+    except Exception as e:
+        print(f"[CLEANUP] Fehler: {e}")
+
+# ===========================================================================
+# CACHES - Kurzbeschreibung UND Unterkategorie
+# ===========================================================================
+
+KURZBESCHREIBUNG_CACHE = {}  # {objektnummer: kurzbeschreibung}
+UNTERKATEGORIE_CACHE = {}    # {objektnummer: unterkategorie}
+
+def load_caches():
+    """Lädt Kurzbeschreibungen UND Unterkategorien aus Airtable in Caches"""
+    global KURZBESCHREIBUNG_CACHE, UNTERKATEGORIE_CACHE
+    
+    if not (AIRTABLE_TOKEN and AIRTABLE_BASE and airtable_table_segment()):
+        print("[CACHE] Airtable nicht konfiguriert - Caches leer")
+        return
+    
+    if FULL_REPLACE:
+        print("[CACHE] FULL_REPLACE Modus - Cache übersprungen")
+        return
+    
+    try:
+        all_ids, all_fields = airtable_list_all()
+        for fields in all_fields:
+            obj_nr = fields.get("Objektnummer", "").strip()
+            if not obj_nr:
+                continue
+            
+            kurzbeschreibung = fields.get("Kurzbeschreibung", "").strip()
+            if kurzbeschreibung:
+                KURZBESCHREIBUNG_CACHE[obj_nr] = kurzbeschreibung
+            
+            unterkategorie = fields.get("Unterkategorie", "").strip()
+            if unterkategorie:
+                UNTERKATEGORIE_CACHE[obj_nr] = unterkategorie
+        
+        print(f"[CACHE] {len(KURZBESCHREIBUNG_CACHE)} Kurzbeschreibungen geladen")
+        print(f"[CACHE] {len(UNTERKATEGORIE_CACHE)} Unterkategorien geladen")
+    except Exception as e:
+        print(f"[CACHE] Fehler beim Laden: {e}")
+
+def get_cached_kurzbeschreibung(objektnummer: str) -> str:
+    return KURZBESCHREIBUNG_CACHE.get(objektnummer, "")
+
+def get_cached_unterkategorie(objektnummer: str) -> str:
+    return UNTERKATEGORIE_CACHE.get(objektnummer, "")
+
+# ===========================================================================
+# GPT KURZBESCHREIBUNG - NEUE VERSION
+# ===========================================================================
+
+KURZBESCHREIBUNG_FIELDS = [
+    "Objekttyp",
+    "Baujahr",
+    "Wohnfläche",
+    "Grundstück",
+    "Zimmer",
+    "Preis",
+    "Standort",
+    "Energieeffizienz",
+    "Besonderheiten"
+]
+
+def normalize_kurzbeschreibung(gpt_output: str, scraped_data: dict) -> str:
+    """Normalisiert GPT-Ausgabe. KEINE Platzhalter, nur vorhandene Felder."""
+    parsed = {}
+    for line in gpt_output.strip().split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        if ":" in line:
+            key, value = line.split(":", 1)
+            key = key.strip()
+            value = value.strip()
+            if value and value not in ["-", "—", "k. A.", "unbekannt", "nicht angegeben", ""]:
+                parsed[key] = value
+    
+    scrape_mapping = {
+        "Zimmer": "zimmer",
+        "Wohnfläche": "wohnflaeche", 
+        "Grundstück": "grundstueck",
+        "Baujahr": "baujahr",
+        "Preis": "preis",
+        "Standort": "standort",
+    }
+    
+    for field, scrape_key in scrape_mapping.items():
+        if field not in parsed or not parsed[field]:
+            scrape_value = scraped_data.get(scrape_key, "")
+            if scrape_value and str(scrape_value).strip():
+                if field == "Preis":
+                    try:
+                        preis_num = float(str(scrape_value).replace(".", "").replace(",", ".").replace("€", "").strip())
+                        parsed[field] = f"{int(preis_num)} €"
+                    except:
+                        pass
+                elif field == "Wohnfläche":
+                    val = str(scrape_value).replace("ca.", "").replace("m²", "").strip()
+                    if val:
+                        parsed[field] = f"{val} m²"
+                elif field == "Grundstück":
+                    val = str(scrape_value).replace("ca.", "").replace("m²", "").strip()
+                    if val:
+                        parsed[field] = f"{val} m²"
+                else:
+                    parsed[field] = str(scrape_value)
+    
+    output_lines = []
+    for field in KURZBESCHREIBUNG_FIELDS:
+        value = parsed.get(field, "")
+        if value and value.strip():
+            output_lines.append(f"{field}: {value}")
+    
+    return "\n".join(output_lines)
+
+def generate_kurzbeschreibung(beschreibung: str, titel: str, kategorie: str, preis: str, ort: str,
+                               zimmer: str = "", wohnflaeche: str = "", grundstueck: str = "", baujahr: str = "",
+                               objektnummer: str = "") -> str:
+    """Generiert strukturierte Kurzbeschreibung mit GPT."""
+    
+    if objektnummer:
+        cached = get_cached_kurzbeschreibung(objektnummer)
+        if cached:
+            print(f"[CACHE] Kurzbeschreibung aus Cache für {objektnummer[:20]}...")
+            return cached
+    
+    scraped_data = {
+        "kategorie": kategorie,
+        "preis": preis,
+        "standort": ort,
+        "zimmer": zimmer,
+        "wohnflaeche": wohnflaeche,
+        "grundstueck": grundstueck,
+        "baujahr": baujahr,
+    }
+    
+    if not OPENAI_API_KEY:
+        return normalize_kurzbeschreibung("", scraped_data)
+    
+    prompt = f"""# Rolle
+Du bist ein präziser Immobilien-Datenanalyst und Parser. Deine Aufgabe ist es, aus unstrukturierten Immobilienanzeigen ausschließlich objektive, explizit genannte Fakten zu extrahieren und streng strukturiert auszugeben. Du arbeitest regelbasiert, deterministisch und formatgenau. Kreative Ergänzungen sind untersagt.
+
+# Aufgabe
+1. Analysiere die bereitgestellte Immobilienanzeige vollständig.
+2. Extrahiere nur eindeutig genannte, objektive Fakten.
+3. Gib die strukturierte Kurzbeschreibung exakt im vorgegebenen Zeilenformat aus.
+4. Lasse jedes Feld vollständig weg, zu dem keine eindeutige Angabe vorliegt.
+
+# Eingabedaten
+TITEL: {titel}
+KATEGORIE: {kategorie}
+PREIS: {preis if preis else 'nicht angegeben'}
+STANDORT: {ort if ort else 'nicht angegeben'}
+BESCHREIBUNG: {beschreibung[:3000]}
+
+# Erlaubte Felder (Whitelist – verbindlich)
+Objekttyp
+Baujahr
+Wohnfläche
+Grundstück
+Zimmer
+Preis
+Standort
+Energieeffizienz
+Besonderheiten
+
+# Ausgabeformat (verbindlich)
+Objekttyp: [Einfamilienhaus | Mehrfamilienhaus | Eigentumswohnung | Baugrundstück | Reihenhaus | Doppelhaushälfte | Sonstiges]
+Baujahr: [Jahr]
+Wohnfläche: [Zahl in m²]
+Grundstück: [Zahl in m²]
+Zimmer: [Anzahl]
+Preis: [Zahl in €]
+Standort: [Ort oder PLZ Ort]
+Energieeffizienz: [Klasse]
+Besonderheiten: [kommaseparierte Liste]
+
+# Strikte Regeln (bindend)
+• Es ist strengstens untersagt, eigene Felder zu erfinden.
+• Felder wie „Schlafzimmer", „Kategorie", „Etage", „Ausstattung", „Kauf/Miete" sind verboten.
+• Es dürfen keine Platzhalter verwendet werden (z. B. „-", „—", „k. A.", „unbekannt").
+• Wenn ein Feld nicht eindeutig ermittelbar ist, darf die gesamte Zeile nicht ausgegeben werden.
+• KEINE LEERZEILEN in der Ausgabe!
+
+# Ziel
+Die Ausgabe wird automatisiert weiterverarbeitet. Jede Abweichung vom Format gilt als Fehler."""
+
+    try:
+        headers = {
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
+            "model": "gpt-4o-mini",
+            "messages": [
+                {"role": "system", "content": "Du bist ein regelbasierter Datenparser. Halte dich strikt an die Vorgaben. Keine Kreativität, keine Ergänzungen. Keine Leerzeilen."},
+                {"role": "user", "content": prompt}
+            ],
+            "max_tokens": 400,
+            "temperature": 0.0
+        }
+        
+        response = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=30
+        )
+        response.raise_for_status()
+        
+        result = response.json()
+        gpt_output = result["choices"][0]["message"]["content"].strip()
+        
+        kurzbeschreibung = normalize_kurzbeschreibung(gpt_output, scraped_data)
+        
+        print(f"[GPT] Kurzbeschreibung generiert ({len(kurzbeschreibung)} Zeichen)")
+        return kurzbeschreibung
+        
+    except Exception as e:
+        print(f"[ERROR] GPT Kurzbeschreibung fehlgeschlagen: {e}")
+        return normalize_kurzbeschreibung("", scraped_data)
+
+# ===========================================================================
+# GPT UNTERKATEGORIE-KLASSIFIKATION MIT CACHING
+# ===========================================================================
+
+KEYS_WOHNUNG = ["wohnung", "etagenwohnung", "eigentumswohnung", "apartment", "etw", "penthouse", "maisonette"]
+KEYS_HAUS = ["haus", "einfamilienhaus", "zweifamilienhaus", "reihenhaus", "doppelhaushälfte", "villa", "bungalow", "efh", "dhh", "mfh"]
+KEYS_GEWERBE = ["gewerbe", "büro", "laden", "praxis", "lager", "halle", "gastronomie", "gewerbefläche", "bürofläche"]
+KEYS_GRUNDSTUECK = ["grundstück", "baugrundstück", "bauland", "bauplatz"]
+
+def heuristic_subcategory(titel: str, beschreibung: str) -> str:
+    """Heuristische Fallback-Klassifikation"""
+    text = (titel + " " + beschreibung).lower()
+    
+    scores = {
+        "Grundstück": sum(1 for k in KEYS_GRUNDSTUECK if k in text),
+        "Gewerbe": sum(1 for k in KEYS_GEWERBE if k in text),
+        "Wohnung": sum(1 for k in KEYS_WOHNUNG if k in text),
+        "Haus": sum(1 for k in KEYS_HAUS if k in text),
+    }
+    
+    # Grundstück hat höchste Priorität
+    if scores["Grundstück"] >= 1:
+        return "Grundstück"
+    
+    # Gewerbe vor Wohnung/Haus
+    if scores["Gewerbe"] >= 2:
+        return "Gewerbe"
+    
+    best = max(scores, key=scores.get)
+    if scores[best] >= 1:
+        return best
+    
+    return "Haus"  # Default
+
+def gpt_classify_unterkategorie(titel: str, beschreibung: str, objektnummer: str, kategorie: str) -> str:
+    """Klassifiziert die Unterkategorie via GPT. MIT CACHING."""
+    
+    if objektnummer:
+        cached = get_cached_unterkategorie(objektnummer)
+        if cached:
+            print(f"[CACHE] Unterkategorie aus Cache: {cached}")
+            return cached
+    
+    if not OPENAI_API_KEY:
+        return heuristic_subcategory(titel, beschreibung)
+    
+    # Erlaubte Kategorien
+    allowed_cats = "Wohnung, Haus, Gewerbe, Grundstück"
+    
+    prompt = f"""Klassifiziere dieses Immobilien-Exposé in EXAKT eine der folgenden Kategorien:
+{allowed_cats}
+
+WICHTIG:
+- Gib NUR das eine Wort aus (z.B. "Wohnung" oder "Gewerbe")
+- Keine Erklärung, kein Punkt, nur das Wort
+- Bei Büro, Laden, Praxis, Lager, Halle → "Gewerbe"
+- Bei Baugrundstück, Bauland, Bauplatz → "Grundstück"
+- Bei Eigentumswohnung, ETW, Apartment → "Wohnung"
+- Bei Einfamilienhaus, DHH, Reihenhaus, Villa → "Haus"
+
+Titel: {titel}
+Beschreibung: {beschreibung[:1500]}"""
+
+    try:
+        headers = {
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
+            "model": "gpt-4o-mini",
+            "messages": [
+                {"role": "system", "content": "Du bist ein präziser Immobilien-Klassifizierer. Antworte mit genau einem Wort."},
+                {"role": "user", "content": prompt}
+            ],
+            "max_tokens": 10,
+            "temperature": 0.0
+        }
+        
+        response = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=15
+        )
+        response.raise_for_status()
+        
+        result = response.json()
+        output = result["choices"][0]["message"]["content"].strip().replace(".", "")
+        
+        valid = {"Wohnung", "Haus", "Gewerbe", "Grundstück"}
+        
+        if output in valid:
+            print(f"[GPT] Unterkategorie: {output}")
+            return output
+        else:
+            print(f"[GPT] Ungültige Kategorie '{output}', verwende Heuristik")
+            return heuristic_subcategory(titel, beschreibung)
+        
+    except Exception as e:
+        print(f"[ERROR] GPT Klassifikation fehlgeschlagen: {e}")
+        return heuristic_subcategory(titel, beschreibung)
+
+# ===========================================================================
+# PROPSTACK IFRAME FUNCTIONS
+# ===========================================================================
+
+def collect_detail_page_links_with_categories() -> List[Tuple[str, str, str]]:
+    """Sammle Links zu Detailseiten MIT Kategorie/Unterkategorie von Übersichtsseite"""
+    print(f"[LIST] Hole {LIST_URL}")
+    
+    soup = soup_get(LIST_URL)
+    
+    detail_data = []
+    
+    section_mapping = {
+        "einfamilienhaus": ("Kaufen", "Haus"),
+        "einfamilienhäuser": ("Kaufen", "Haus"),
+        "doppelhaushälfte": ("Kaufen", "Haus"),
+        "doppelhaushälften": ("Kaufen", "Haus"),
+        "zweifamilienhaus": ("Kaufen", "Haus"),
+        "zweifamilienhäuser": ("Kaufen", "Haus"),
+        "mehrfamilienhaus": ("Kaufen", "Haus"),
+        "mehrfamilienhäuser": ("Kaufen", "Haus"),
+        "eigentumswohnung": ("Kaufen", "Wohnung"),
+        "eigentumswohnungen": ("Kaufen", "Wohnung"),
+        "gewerbeimmobilie": (None, "Gewerbe"),
+        "gewerbeimmobilien": (None, "Gewerbe"),
+        "mietobjekt": ("Mieten", None),
+        "mietobjekte": ("Mieten", None),
+        "grundstück": ("Kaufen", "Grundstück"),
+        "grundstücke": ("Kaufen", "Grundstück"),
+        "neubau": ("Kaufen", "Haus"),
+    }
+    
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        
+        if not (href.startswith("/") or "alainreinickeimmobilien.de" in href):
+            continue
+        
+        full_url = urljoin(BASE, href)
+        full_url = full_url.split("#")[0].split("?")[0]
+        
+        if any(d[0] == full_url for d in detail_data) or full_url == LIST_URL:
+            continue
+        
+        path_lower = full_url.lower()
+        if any(skip in path_lower for skip in [
+            "/startseite", "/warum-wir", "/immobilien-ankauf",
+            "/immobilienbewertung", "/aktuelle-angebote", "/kontakt",
+            "/impressum", "/datenschutz", "/agb", "/cookie",
+            BASE + "/#", BASE + "/$"
+        ]):
+            continue
+        
+        if full_url == BASE or full_url == BASE + "/":
+            continue
+        
+        prev_header_text = ""
+        for sibling in a.find_all_previous(["h2", "h3", "h4"]):
+            prev_header_text = sibling.get_text(strip=True).lower()
+            break
+        
+        kategorie = "Kaufen"
+        unterkategorie = "Haus"
+        
+        if prev_header_text:
+            for key, (kat, unterkat) in section_mapping.items():
+                if key in prev_header_text:
+                    if kat:
+                        kategorie = kat
+                    if unterkat:
+                        unterkategorie = unterkat
+                    break
+        
+        detail_data.append((full_url, kategorie, unterkategorie))
+    
+    print(f"[LIST] Gefunden: {len(detail_data)} Detailseiten")
+    return detail_data
+
+def extract_iframe_from_detail_page(detail_url: str) -> Optional[str]:
+    """Extrahiere Propstack iframe-URL von einer Detailseite"""
+    try:
+        soup = soup_get(detail_url, delay=1.0)
+        
+        for iframe in soup.find_all("iframe"):
+            src = iframe.get("src", "")
+            if "landingpage.immobilien" in src and "/public/exposee/" in src:
+                return src
+        
+        return None
+        
+    except Exception as e:
+        print(f"[ERROR] Fehler beim Laden der Detailseite: {e}")
+        return None
+
+def get_propstack_property_data_from_iframe(iframe_url: str) -> dict:
+    """Hole Immobilien-Daten direkt aus Propstack iframe"""
+    try:
+        soup = soup_get(iframe_url, delay=1.0)
+        
+        data = {
+            "titel": "",
+            "beschreibung": "",
+            "preis": "",
+            "ort": "",
+            "kategorie": "Kaufen",
+            "unterkategorie": "Haus",
+            "bild_url": "",
+            "zimmer": "",
+            "wohnflaeche": "",
+            "grundstueck": "",
+            "baujahr": "",
+        }
+        
+        for tag in ["h1", "h2", "title"]:
+            elem = soup.find(tag)
+            if elem:
+                text = _norm(elem.get_text(strip=True))
+                if len(text) > 5:
+                    data["titel"] = text
+                    break
+        
+        text_content = soup.get_text().lower()
+        text_content_full = soup.get_text()
+        
+        # Preis extrahieren
+        price_matches = RE_PRICE.findall(text_content)
+        if price_matches:
+            prices = []
+            for p in price_matches:
+                try:
+                    clean = p.replace(".", "").replace(",", ".")
+                    val = float(clean)
+                    if val > 100:
+                        prices.append((val, p + " €"))
+                except:
+                    pass
+            if prices:
+                prices.sort(reverse=True)
+                data["preis"] = prices[0][1]
+        
+        # Miete Pattern
+        miete_pattern = re.compile(r'(?:Warmmiete|Kaltmiete|Miete)\s*[:.]?\s*([\d.,]+)\s*€', re.IGNORECASE)
+        miete_matches = miete_pattern.findall(text_content_full)
+        
+        if miete_matches:
+            for miete_str in miete_matches:
+                try:
+                    clean = miete_str.replace(".", "").replace(",", ".")
+                    val = float(clean)
+                    if val > 100:
+                        data["preis"] = f"{miete_str} €"
+                        data["kategorie"] = "Mieten"
+                        break
+                except:
+                    pass
+        
+        # PLZ/Ort
+        match = RE_PLZ_ORT.search(text_content_full)
+        if match:
+            data["ort"] = f"{match.group(1)} {match.group(2).strip()}"
+        
+        if not data["ort"]:
+            for meta in soup.find_all("meta"):
+                content = meta.get("content", "")
+                match = RE_PLZ_ORT.search(content)
+                if match:
+                    data["ort"] = f"{match.group(1)} {match.group(2).strip()}"
+                    break
+        
+        # Zusätzliche Daten
+        zimmer_match = re.search(r'(\d+)\s*Zimmer', text_content_full, re.IGNORECASE)
+        if zimmer_match:
+            data["zimmer"] = zimmer_match.group(1)
+        
+        wohnflaeche_match = re.search(r'(?:ca\.\s*)?(\d+(?:[.,]\d+)?)\s*m²\s*(?:Wohnfläche|Wohnfl)', text_content_full, re.IGNORECASE)
+        if wohnflaeche_match:
+            data["wohnflaeche"] = wohnflaeche_match.group(1).replace(",", ".")
+        
+        grundstueck_match = re.search(r'(?:ca\.\s*)?(\d+(?:[.,]\d+)?)\s*m²\s*(?:Grundstück|Grundst)', text_content_full, re.IGNORECASE)
+        if grundstueck_match:
+            data["grundstueck"] = grundstueck_match.group(1).replace(",", ".")
+        
+        baujahr_match = re.search(r'Baujahr[:\s]+(\d{4})', text_content_full, re.IGNORECASE)
+        if baujahr_match:
+            data["baujahr"] = baujahr_match.group(1)
+        
+        # Beschreibung
+        paragraphs = []
+        for p in soup.find_all(["p", "div"]):
+            text = _norm(p.get_text())
+            if 50 < len(text) < 500:
+                if not any(skip in text.lower() for skip in ["cookie", "datenschutz", "impressum", "javascript"]):
+                    paragraphs.append(text)
+                    if len(paragraphs) >= 5:
+                        break
+        
+        if paragraphs:
+            data["beschreibung"] = clean_text("\n\n".join(paragraphs)[:5000])
+        
+        # Bild extrahieren
+        for class_name in ["property-image", "object-image", "main-image", "gallery-image", "slider-image"]:
+            img = soup.find("img", class_=lambda x: x and class_name in str(x).lower())
+            if img:
+                src = img.get("src", "")
+                if src and not any(skip in src.lower() for skip in ["logo", "icon", "favicon", "placeholder"]):
+                    data["bild_url"] = src if src.startswith("http") else urljoin(iframe_url, src)
+                    break
+        
+        if not data["bild_url"]:
+            for img in soup.find_all("img"):
+                srcset = img.get("srcset", "")
+                if srcset:
+                    parts = [s.strip().split()[0] for s in srcset.split(",") if s.strip()]
+                    if parts:
+                        src = parts[-1]
+                        if not any(skip in src.lower() for skip in ["logo", "icon", "favicon"]):
+                            data["bild_url"] = src if src.startswith("http") else urljoin(iframe_url, src)
+                            break
+        
+        if not data["bild_url"]:
+            for img in soup.find_all("img"):
+                src = img.get("src", "")
+                alt = img.get("alt", "").lower()
+                
+                if any(skip in src.lower() for skip in ["logo", "icon", "favicon"]):
+                    continue
+                if any(skip in alt for skip in ["logo", "icon"]):
+                    continue
+                
+                if src:
+                    data["bild_url"] = src if src.startswith("http") else urljoin(iframe_url, src)
+                    break
+        
+        return data
+        
+    except Exception as e:
+        print(f"[ERROR] Failed to load iframe: {e}")
+        return None
+
+# ===========================================================================
+# SCRAPING FUNCTIONS
+# ===========================================================================
+
+def collect_all_properties() -> List[dict]:
+    """Sammle alle Immobilien von der Website"""
+    
+    detail_data = collect_detail_page_links_with_categories()
+    
+    if not detail_data:
+        print("[WARN] Keine Detailseiten gefunden!")
+        return []
+    
+    all_properties = []
+    
+    for i, (detail_url, overview_kategorie, overview_unterkategorie) in enumerate(detail_data, 1):
+        print(f"\n[SCRAPE] {i}/{len(detail_data)}")
+        
+        try:
+            iframe_url = extract_iframe_from_detail_page(detail_url)
+            
+            if not iframe_url:
+                print(f"  ⚠️  Überspringe - kein iframe gefunden")
+                continue
+            
+            prop_data = get_propstack_property_data_from_iframe(iframe_url)
+            
+            if prop_data:
+                # Extrahiere Objektnummer
+                match = re.search(r"(eyJ[A-Za-z0-9+/=]+)", iframe_url)
+                if match:
+                    token_b64 = match.group(1)
+                    try:
+                        padding = len(token_b64) % 4
+                        if padding:
+                            token_b64 += "=" * (4 - padding)
+                        decoded = base64.b64decode(token_b64).decode('utf-8')
+                        token_data = json.loads(decoded)
+                        prop_data["objektnummer"] = token_data.get("property_token", "")
+                    except:
+                        prop_data["objektnummer"] = detail_url.split("/")[-1]
+                else:
+                    prop_data["objektnummer"] = detail_url.split("/")[-1]
+                
+                # Kategorie setzen
+                if overview_kategorie and prop_data["kategorie"] != "Mieten":
+                    prop_data["kategorie"] = overview_kategorie
+                
+                # Unterkategorie via GPT klassifizieren (mit Cache!)
+                prop_data["unterkategorie"] = gpt_classify_unterkategorie(
+                    titel=prop_data.get("titel", ""),
+                    beschreibung=prop_data.get("beschreibung", ""),
+                    objektnummer=prop_data.get("objektnummer", ""),
+                    kategorie=prop_data.get("kategorie", "Kaufen")
+                )
+                
+                # Gewerbe-Spezialfall: Kategorie aus Preis
+                if prop_data["unterkategorie"] == "Gewerbe" and not overview_kategorie:
+                    preis_text = prop_data.get("preis", "")
+                    try:
+                        clean = preis_text.replace("€", "").replace(".", "").replace(",", ".").strip()
+                        preis_val = float(clean)
+                        if preis_val < 30000:
+                            prop_data["kategorie"] = "Mieten"
+                        else:
+                            prop_data["kategorie"] = "Kaufen"
+                    except:
+                        prop_data["kategorie"] = "Kaufen"
+                
+                prop_data["url"] = detail_url
+                
+                all_properties.append(prop_data)
+                
+                bild_status = "✅" if prop_data.get("bild_url") else "❌"
+                print(f"  → {prop_data.get('kategorie', 'N/A'):8} | {prop_data.get('unterkategorie', 'N/A'):12} | {prop_data.get('titel', 'Unbekannt')[:40]} | Bild: {bild_status}")
+            else:
+                print(f"  ⚠️  Keine Daten extrahiert")
+                
+        except Exception as e:
+            print(f"  ❌ Fehler: {e}")
+            continue
+    
+    return all_properties
+
+def make_record(prop: dict) -> dict:
+    """Erstelle Airtable-Record"""
+    preis_value = None
+    if prop.get("preis"):
+        try:
+            clean = prop["preis"].replace("€", "").replace(".", "").replace(",", ".").strip()
+            preis_value = float(clean)
+        except:
+            pass
+    
+    kurzbeschreibung = generate_kurzbeschreibung(
+        beschreibung=prop.get("beschreibung", ""),
+        titel=prop.get("titel", ""),
+        kategorie=prop.get("kategorie", "Kaufen"),
+        preis=prop.get("preis", ""),
+        ort=prop.get("ort", ""),
+        zimmer=prop.get("zimmer", ""),
+        wohnflaeche=prop.get("wohnflaeche", ""),
+        grundstueck=prop.get("grundstueck", ""),
+        baujahr=prop.get("baujahr", ""),
+        objektnummer=prop.get("objektnummer", "")
+    )
+    
+    record = {
+        "Titel": prop.get("titel", "Unbekannt"),
+        "Kategorie": prop.get("kategorie", "Kaufen"),
+        "Unterkategorie": prop.get("unterkategorie", "Sonstiges"),
+        "Webseite": prop.get("url", ""),
+        "Objektnummer": prop.get("objektnummer", ""),
+        "Beschreibung": clean_text(prop.get("beschreibung", "")),
+        "Kurzbeschreibung": kurzbeschreibung,
+        "Bild": prop.get("bild_url", ""),
+        "Standort": prop.get("ort", ""),
+    }
+    
+    if preis_value is not None:
+        record["Preis"] = preis_value
+    
+    return record
+
 def unique_key(fields: dict) -> str:
     obj = (fields.get("Objektnummer") or "").strip()
     if obj:
@@ -916,24 +938,6 @@ def unique_key(fields: dict) -> str:
         return f"url:{url}"
     return f"hash:{hash(json.dumps(fields, sort_keys=True))}"
 
-def sanitize_record_for_airtable(record: dict, allowed_fields: set) -> dict:
-    # Felder die immer erlaubt sind (auch wenn sie in bestehenden Records leer sind)
-    ALWAYS_ALLOWED = {"Kurzbeschreibung"}
-    
-    if not allowed_fields:
-        return record
-    
-    # Kombiniere allowed_fields mit ALWAYS_ALLOWED
-    all_allowed = allowed_fields | ALWAYS_ALLOWED
-    return {k: v for k, v in record.items() if k in all_allowed}
-
-def airtable_existing_fields() -> set:
-    """Hole existierende Felder - DEAKTIVIERT um alle Felder zuzulassen"""
-    # WICHTIG: Wenn diese Funktion ein leeres Set zurückgibt,
-    # werden ALLE Felder an Airtable gesendet (nicht gefiltert)
-    # Dies ist nötig wenn neue Felder (Unterkategorie, Standort) noch leer sind
-    return set()  # Leeres Set = keine Filterung
-
 # ===========================================================================
 # MAIN
 # ===========================================================================
@@ -941,9 +945,9 @@ def airtable_existing_fields() -> set:
 def run():
     print("[REINICKE] Starte Scraper für alainreinickeimmobilien.de (Propstack)")
     
-    # OPTIMIERUNG: Lade existierende Kurzbeschreibungen aus Airtable
-    print("[INIT] Lade Kurzbeschreibungen-Cache aus Airtable...")
-    load_kurzbeschreibung_cache()
+    # Lade Caches
+    print("[INIT] Lade Caches aus Airtable...")
+    load_caches()
     
     # Sammle alle Immobilien
     all_properties = collect_all_properties()
@@ -954,6 +958,14 @@ def run():
     
     # Konvertiere zu Airtable Records
     all_rows = [make_record(prop) for prop in all_properties]
+    
+    # VALIDIERUNG
+    print(f"\n[VALIDATE] Prüfe {len(all_rows)} Records...")
+    all_rows = filter_valid_records(all_rows)
+    
+    if not all_rows:
+        print("[WARN] Keine gültigen Datensätze nach Filterung.")
+        return
     
     # CSV speichern
     csv_file = "reinicke_immobilien.csv"
@@ -969,24 +981,21 @@ def run():
         print("\n[AIRTABLE] Starte Synchronisation...")
         
         if FULL_REPLACE:
-            print("[AIRTABLE] Modus: FULL REPLACE - Lösche alles und ersetze")
+            print("[AIRTABLE] Modus: FULL REPLACE")
             
-            # Hole alle existierenden Records
             all_ids, all_fields = airtable_list_all()
             
-            # Lösche ALLES
             if all_ids:
                 print(f"[AIRTABLE] Lösche {len(all_ids)} existierende Records...")
                 airtable_batch_delete(all_ids)
             
-            # Erstelle ALLES neu
             print(f"[AIRTABLE] Erstelle {len(all_rows)} neue Records...")
             airtable_batch_create(all_rows)
             
             print(f"[AIRTABLE] ✅ Tabelle komplett ersetzt: {len(all_rows)} Records")
             
         else:
-            print("[AIRTABLE] Modus: INTELLIGENT SYNC - Update nur Änderungen")
+            print("[AIRTABLE] Modus: INTELLIGENT SYNC")
             
             allowed = airtable_existing_fields()
             all_ids, all_fields = airtable_list_all()
@@ -1029,6 +1038,9 @@ def run():
             if to_delete_ids:
                 print(f"[Airtable] Lösche {len(to_delete_ids)} Records...")
                 airtable_batch_delete(to_delete_ids)
+        
+        # CLEANUP
+        cleanup_empty_airtable_records()
         
         print("[Airtable] Synchronisation abgeschlossen.\n")
     else:
