@@ -864,15 +864,65 @@ def get_propstack_property_data_from_iframe(iframe_url: str) -> dict:
         if paragraphs:
             data["beschreibung"] = clean_text("\n\n".join(paragraphs)[:5000])
         
-        # Bild extrahieren
-        for class_name in ["property-image", "object-image", "main-image", "gallery-image", "slider-image"]:
-            img = soup.find("img", class_=lambda x: x and class_name in str(x).lower())
-            if img:
-                src = img.get("src", "")
-                if src and not any(skip in src.lower() for skip in ["logo", "icon", "favicon", "placeholder"]):
-                    data["bild_url"] = src if src.startswith("http") else urljoin(iframe_url, src)
-                    break
+        # BILD EXTRAHIEREN - PROPSTACK SPEZIFISCH
+        # Propstack speichert Hauptbilder als background-image in divs!
         
+        # ANSATZ 1 (PRIORITÄT): Suche nach Titelbild/Hauptbild als background-image
+        # Pattern: <div class="w-100 rounded" title="Titelbild" style="background-image: url(...)">
+        for elem in soup.find_all(attrs={"title": re.compile(r"titelbild|hauptbild|objektbild", re.IGNORECASE)}):
+            style = elem.get("style", "")
+            if "background-image" in style:
+                # Regex für URL-Extraktion (mit und ohne Anführungszeichen)
+                match = re.search(r'url\(["\']?([^"\')\s]+)["\']?\)', style)
+                if match:
+                    url = match.group(1)
+                    if "propstack" in url or "images" in url:
+                        data["bild_url"] = url
+                        print(f"[DEBUG] ✅ Titelbild gefunden (background-image mit title)")
+                        break
+        
+        # ANSATZ 2: Suche nach background-image mit propstack URL
+        if not data["bild_url"]:
+            for elem in soup.find_all(style=True):
+                style = elem.get("style", "")
+                if "background-image" in style and "propstack" in style:
+                    match = re.search(r'url\(["\']?([^"\')\s]+)["\']?\)', style)
+                    if match:
+                        url = match.group(1)
+                        if not any(skip in url.lower() for skip in ["logo", "icon", "avatar", "profile"]):
+                            data["bild_url"] = url
+                            print(f"[DEBUG] ✅ Bild gefunden (background-image propstack)")
+                            break
+        
+        # ANSATZ 3: Suche nach allen background-image Elementen
+        if not data["bild_url"]:
+            for elem in soup.find_all(style=True):
+                style = elem.get("style", "")
+                if "background-image" in style:
+                    match = re.search(r'url\(["\']?([^"\')\s]+)["\']?\)', style)
+                    if match:
+                        url = match.group(1)
+                        # Filtere Logos, Icons, Avatare
+                        if any(skip in url.lower() for skip in ["logo", "icon", "avatar", "profile", "favicon"]):
+                            continue
+                        # Muss eine Bild-URL sein
+                        if any(ext in url.lower() for ext in [".jpg", ".jpeg", ".png", ".webp", "photo", "image"]):
+                            data["bild_url"] = url if url.startswith("http") else urljoin(iframe_url, url)
+                            print(f"[DEBUG] ✅ Bild gefunden (background-image)")
+                            break
+        
+        # ANSATZ 4: Fallback auf img Tags
+        if not data["bild_url"]:
+            for class_name in ["property-image", "object-image", "main-image", "gallery-image", "slider-image"]:
+                img = soup.find("img", class_=lambda x: x and class_name in str(x).lower())
+                if img:
+                    src = img.get("src", "")
+                    if src and not any(skip in src.lower() for skip in ["logo", "icon", "favicon", "placeholder", "avatar"]):
+                        data["bild_url"] = src if src.startswith("http") else urljoin(iframe_url, src)
+                        print(f"[DEBUG] ✅ Bild gefunden (img class)")
+                        break
+        
+        # ANSATZ 5: srcset in img Tags
         if not data["bild_url"]:
             for img in soup.find_all("img"):
                 srcset = img.get("srcset", "")
@@ -880,23 +930,29 @@ def get_propstack_property_data_from_iframe(iframe_url: str) -> dict:
                     parts = [s.strip().split()[0] for s in srcset.split(",") if s.strip()]
                     if parts:
                         src = parts[-1]
-                        if not any(skip in src.lower() for skip in ["logo", "icon", "favicon"]):
+                        if not any(skip in src.lower() for skip in ["logo", "icon", "favicon", "avatar"]):
                             data["bild_url"] = src if src.startswith("http") else urljoin(iframe_url, src)
+                            print(f"[DEBUG] ✅ Bild gefunden (srcset)")
                             break
         
+        # ANSATZ 6: Erstes großes Bild
         if not data["bild_url"]:
             for img in soup.find_all("img"):
                 src = img.get("src", "")
                 alt = img.get("alt", "").lower()
                 
-                if any(skip in src.lower() for skip in ["logo", "icon", "favicon"]):
+                if any(skip in src.lower() for skip in ["logo", "icon", "favicon", "avatar", "profile"]):
                     continue
-                if any(skip in alt for skip in ["logo", "icon"]):
+                if any(skip in alt for skip in ["logo", "icon", "avatar"]):
                     continue
                 
-                if src:
+                if src and len(src) > 20:  # Filter kurze/leere URLs
                     data["bild_url"] = src if src.startswith("http") else urljoin(iframe_url, src)
+                    print(f"[DEBUG] ✅ Bild gefunden (erstes img)")
                     break
+        
+        if not data["bild_url"]:
+            print(f"[WARN] ⚠️ KEIN Bild gefunden!")
         
         return data
         
